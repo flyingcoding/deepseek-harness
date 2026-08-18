@@ -40,7 +40,7 @@
 | 键 | 默认值 | 约定 |
 |---|---:|---|
 | `readWindowMax` | `50` | `before` 或 `after` 的最大原始事件数。 |
-| `persistedInspectConcurrency` | `4` | 一次批量读取中的最大并发持久化日志检查数；必须是正的安全整数。 |
+| `persistedInspectConcurrency` | `1` | 一次批量读取中的最大并发持久化日志检查数；必须是正的安全整数。默认 1，使一次批量读取最多同时在内存中保留一份已检查日志。 |
 
 ## 模型体验
 

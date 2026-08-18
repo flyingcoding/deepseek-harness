@@ -1252,8 +1252,9 @@ interface FixtureSearchToken {
 
 /**
  * Browser-safe approximation of SQLite FTS5 unicode61 token boundaries.
- * Keeping phrase matching token-based prevents the development fixture from
- * promising arbitrary within-token substring behavior that production lacks.
+ * Matching mirrors the production query contract: latin terms compare as
+ * folded tokens (no within-token substrings), while CJK terms compare as
+ * bigrams/unigrams over the raw text, like the host index.
  */
 function searchTokenSpans(value: string): { text: string; tokens: FixtureSearchToken[] } {
   const text = value.replace(/\s+/gu, ' ').trim()
@@ -1293,21 +1294,115 @@ interface FixturePhraseMatch {
   end: number
 }
 
-/** Count exact contiguous token-phrase occurrences and retain the first display span. */
-function phraseMatch(document: readonly FixtureSearchToken[], phrase: readonly string[]): FixturePhraseMatch {
-  if (phrase.length === 0 || phrase.length > document.length) return { count: 0, start: 0, end: 0 }
-  let count = 0
-  let firstStart = 0
-  let firstEnd = 0
-  for (let start = 0; start <= document.length - phrase.length; start++) {
-    if (!phrase.every((token, offset) => document[start + offset]?.value === token)) continue
-    count++
-    if (count === 1) {
-      firstStart = document[start]?.start ?? 0
-      firstEnd = document[start + phrase.length - 1]?.end ?? firstStart
+/** One ANDed query term: a folded latin token or a CJK bigram/unigram. */
+interface FixtureQueryTerm {
+  /** Folded token value, or the raw bigram/unigram characters. */
+  text: string
+  /** True when `text` must match as a raw-text substring instead of a token. */
+  cjk: boolean
+}
+
+// Mirrors the host CJK blocks in session-query-sqlite/src/query.ts.
+const FIXTURE_CJK_CHAR = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u{20000}-\u{2ceaf}\u{2f800}-\u{2fa1f}]/u
+
+/** Fold one token like `searchTokenSpans` does for document tokens. */
+function fixtureFoldToken(value: string): string {
+  return value.normalize('NFD').replace(/\p{M}+/gu, '').toLowerCase()
+}
+
+/**
+ * Split a query into ANDed terms, expanding CJK runs into the bigrams (or the
+ * lone unigram) the host index stores; punctuation-only terms cannot match
+ * stored tokens and are dropped.
+ */
+function fixtureQueryTerms(query: string): FixtureQueryTerm[] {
+  const terms: FixtureQueryTerm[] = []
+  for (const term of query.split(/\s+/u)) {
+    if (term.length === 0) continue
+    let run = ''
+    let word = ''
+    const flushWord = (): void => {
+      if (word.length === 0) return
+      const folded = fixtureFoldToken(word)
+      if (folded !== '') terms.push({ text: folded, cjk: false })
+      word = ''
+    }
+    const flushRun = (): void => {
+      if (run.length === 0) return
+      const characters = Array.from(run)
+      if (characters.length === 1) {
+        terms.push({ text: characters[0] as string, cjk: true })
+      } else {
+        for (let index = 0; index + 1 < characters.length; index++) {
+          terms.push({ text: `${characters[index]}${characters[index + 1]}`, cjk: true })
+        }
+      }
+      run = ''
+    }
+    for (const character of term) {
+      if (FIXTURE_CJK_CHAR.test(character)) {
+        flushWord()
+        run += character
+      } else {
+        flushRun()
+        word += character
+      }
+    }
+    flushWord()
+    flushRun()
+  }
+  return terms
+}
+
+/** Count one term's occurrences and merge the first display span. */
+function countQueryTerm(
+  document: { text: string; tokens: readonly FixtureSearchToken[] },
+  term: FixtureQueryTerm,
+  state: { count: number; firstStart: number; firstEnd: number },
+): void {
+  if (term.cjk) {
+    const characters = Array.from(document.text)
+    const needle = Array.from(term.text)
+    for (let index = 0; index + needle.length <= characters.length; index++) {
+      let equal = true
+      for (let offset = 0; offset < needle.length; offset++) {
+        if (characters[index + offset] !== needle[offset]) {
+          equal = false
+          break
+        }
+      }
+      if (!equal) continue
+      state.count++
+      if (state.firstStart === -1 || index < state.firstStart) {
+        state.firstStart = index
+        state.firstEnd = index + needle.length
+      }
+    }
+    return
+  }
+  for (const token of document.tokens) {
+    if (token.value !== term.text) continue
+    state.count++
+    if (state.firstStart === -1 || token.start < state.firstStart) {
+      state.firstStart = token.start
+      state.firstEnd = token.end
     }
   }
-  return { count, start: firstStart, end: firstEnd }
+}
+
+/** AND every query term over one document; all terms must occur at least once. */
+function queryMatch(
+  document: { text: string; tokens: readonly FixtureSearchToken[] },
+  query: readonly FixtureQueryTerm[],
+): FixturePhraseMatch {
+  const state = { count: 0, firstStart: -1, firstEnd: 0 }
+  for (const term of query) {
+    const before = state.count
+    countQueryTerm(document, term, state)
+    if (state.count === before) return { count: 0, start: 0, end: 0 }
+  }
+  if (state.firstStart === -1) return { count: 0, start: 0, end: 0 }
+  return { count: state.count, start: state.firstStart, end: state.firstEnd }
 }
 
 /** Match-centered fixture excerpt, bounded by Unicode code points for the sidebar. */
@@ -2187,7 +2282,7 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
             details: {},
           })
         }
-        const query = searchTokenSpans(request.payload.query).tokens.map(token => token.value)
+        const query = fixtureQueryTerms(request.payload.query)
         const matches = sessions.flatMap((summary) => {
           const log = logs.get(summary.sessionId) ?? []
           const current = new Set(foldSurface(log).nodes)
@@ -2195,7 +2290,7 @@ function createFixtureWorld(options: FixtureOptions): FixtureWorld {
             if (!current.has(event.seq)) return []
             const eventText = searchEventText(event)
             const document = searchTokenSpans(eventText)
-            const match = phraseMatch(document.tokens, query)
+            const match = queryMatch(document, query)
             if (match.count === 0) return []
             return [{
               sessionId: summary.sessionId,

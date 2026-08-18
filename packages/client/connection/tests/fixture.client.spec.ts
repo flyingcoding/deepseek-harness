@@ -62,7 +62,7 @@ describe('createFixtureApi', () => {
     expect(response.result.value.items[1]?.parentSessionId).toBe('fx-alpha') // lineage material
   })
 
-  it('searches current message text with literal unicode61-style token phrases', async () => {
+  it('searches current message text with ANDed literal terms and CJK bigrams', async () => {
     const api = createFixtureApi()
     const signal = new AbortController().signal
     const phrase = await api.sessions.search(req({ query: 'FIXTURE 历史消息' }), signal)
@@ -103,6 +103,24 @@ describe('createFixtureApi', () => {
       ok: true,
       value: { items: [], hasMore: false },
     })
+    const nonAdjacent = await api.sessions.search(req({ query: '消息 fixture' }), signal)
+    expect(nonAdjacent.result).toMatchObject({
+      ok: true,
+      value: { items: [{ sessionId: 'fx-alpha' }] },
+    })
+    const bigram = await api.sessions.search(req({ query: '历史' }), signal)
+    expect(bigram.result).toMatchObject({
+      ok: true,
+      value: { items: [{ sessionId: 'fx-alpha' }] },
+    })
+    if (!bigram.result.ok) throw new Error('bigram search failed')
+    expect(bigram.result.value.items[0]?.snippet).toContain('历史')
+    const missingTerm = await api.sessions.search(req({ query: '历史 磁盘' }), signal)
+    expect(missingTerm.result).toEqual({
+      ok: true,
+      value: { items: [], hasMore: false },
+    })
+
     const reasoningOnly = await api.sessions.search(req({ query: '思考过程' }), signal)
     expect(reasoningOnly.result).toEqual({
       ok: true,

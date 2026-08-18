@@ -3,16 +3,21 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { SessionSearchCursor, type SessionQueryErrorCode } from '@deepseek-ai/dsh-session-query'
 import {
   buildEventWhere,
+  buildFtsQuery,
   buildSessionWhere,
+  CJK_SEPARATOR,
+  codepointLength,
+  decodeMarkedText,
   FTS_HIGHLIGHT_END,
   FTS_HIGHLIGHT_START,
   makeSnippet,
   normalizeEventRequest,
   normalizeSessionRequest,
-  quoteFtsData,
   requestFingerprint,
+  sanitizeFtsText,
   SQLITE_FTS5_OUTER_PREDICATE_LIMIT,
   SQLITE_MAX_PAGE_LIMIT,
+  tokenizeSearchText,
   type NormalizedEventRequest,
   type NormalizedSessionRequest,
 } from '../src/query.ts'
@@ -203,8 +208,86 @@ describe('SQLite search predicate compilation', () => {
 })
 
 describe('SQLite query identity and presentation', () => {
-  it('quotes all caller MATCH syntax as data', () => {
-    expect(quoteFtsData('say "needle" OR *')).toBe('"say ""needle"" OR *"')
+  it('ANDs literal terms while quoting all caller MATCH syntax as data', () => {
+    expect(buildFtsQuery('say "needle" OR *')).toBe('"say" """needle""" "OR"')
+    expect(buildFtsQuery('needle OR absent')).toBe('"needle" "OR" "absent"')
+    expect(buildFtsQuery('*')).toBe('"*"')
+    expect(buildFtsQuery('CAFE')).toBe('"CAFE"')
+  })
+
+  it('expands CJK query terms into the bigrams the index stores', () => {
+    expect(buildFtsQuery('内存')).toBe('"内存"')
+    expect(buildFtsQuery('内')).toBe('"内"')
+    expect(buildFtsQuery('内存溢出')).toBe('"内存" "存溢" "溢出"')
+    expect(buildFtsQuery('OOM内存')).toBe('"OOM" "内存"')
+    expect(buildFtsQuery('内存 溢出')).toBe('"内存" "溢出"')
+    expect(buildFtsQuery('a内存b')).toBe('"a" "内存" "b"')
+    // The engine normalizes queries first; the defensive empty-term arm still
+    // answers direct double-space input.
+    expect(buildFtsQuery('a  b')).toBe('"a" "b"')
+  })
+
+  it('tokenizes CJK runs as unigram and bigram streams and leaves other text intact', () => {
+    const separator = CJK_SEPARATOR
+    expect(tokenizeSearchText('内存')).toBe(`内${separator}存${separator}内存${separator}`)
+    expect(tokenizeSearchText('内存溢出')).toBe(
+      `内${separator}存${separator}溢${separator}出${separator}内存${separator}存溢${separator}溢出${separator}`,
+    )
+    expect(tokenizeSearchText('OOM 内存 问题')).toBe(`OOM 内${separator}存${separator}内存${separator} 问${separator}题${separator}问题${separator}`)
+    expect(tokenizeSearchText('plain')).toBe('plain')
+    expect(tokenizeSearchText('')).toBe('')
+  })
+
+  it('decodes tokenized marked CJK text back to readable text with match positions', () => {
+    const separator = CJK_SEPARATOR
+    const start = FTS_HIGHLIGHT_START
+    const end = FTS_HIGHLIGHT_END
+    const marked = `今${separator}天${separator}遇${separator}到${separator}内${separator}存${separator}溢${separator}出${separator}的${separator}问${separator}题${separator}今天${separator}天遇${separator}遇到${separator}到内${separator}${start}内存${end}${separator}存溢${separator}溢出${separator}出的${separator}的问${separator}问题${separator}`
+    expect(decodeMarkedText(marked)).toEqual({ text: '今天遇到内存溢出的问题', matchStart: 4 })
+
+    const unigramMarked = `${start}内${end}${separator}存${separator}内存${separator}`
+    expect(decodeMarkedText(unigramMarked)).toEqual({ text: '内存', matchStart: 0 })
+
+    const latinMarked = `An ${start}AI${end} helper`
+    expect(decodeMarkedText(latinMarked)).toEqual({ text: 'An AI helper', matchStart: 3 })
+  })
+
+  it('decodes fragmented CJK windows by anchoring at the first marked token', () => {
+    const separator = CJK_SEPARATOR
+    const start = FTS_HIGHLIGHT_START
+    const end = FTS_HIGHLIGHT_END
+    // A unigram-zone fragment with a marked unigram emits from the match on.
+    expect(decodeMarkedText(
+      `存${separator}${start}溢${end}${separator}出${separator}内存${separator}存溢${separator}溢出${separator}`,
+    )).toEqual({ text: '溢出', matchStart: 0 })
+    // A markless unigram-only fragment emits its characters verbatim.
+    expect(decodeMarkedText(`内${separator}存${separator}溢${separator}`))
+      .toEqual({ text: '内存溢', matchStart: -1 })
+    // A single-character run has no bigram zone.
+    expect(decodeMarkedText(`${start}内${end}`)).toEqual({ text: '内', matchStart: 0 })
+    // A marked bigram fragment anchors on the bigram and spells the suffix.
+    expect(decodeMarkedText(
+      `${start}内存${end}${separator}存溢${separator}溢出${separator}`,
+    )).toEqual({ text: '内存溢出', matchStart: 0 })
+    // A complete run truncated inside its bigram zone stays complete-shaped.
+    expect(decodeMarkedText(
+      `内${separator}存${separator}溢${separator}出${separator}内存${separator}存溢${separator}溢`,
+    )).toEqual({ text: '内存溢出', matchStart: -1 })
+    // The anchor bigram owns the snippet position even when a later bigram
+    // is marked too, and a window-truncated tail token still contributes.
+    expect(decodeMarkedText(
+      `${start}内存${end}${separator}${start}存溢${end}${separator}溢出${separator}`,
+    )).toEqual({ text: '内存溢出', matchStart: 0 })
+    expect(decodeMarkedText(`${start}内存${end}${separator}存`))
+      .toEqual({ text: '内存存', matchStart: 0 })
+  })
+
+  it('counts code points without materializing arrays and sanitizes reserved collisions', () => {
+    expect(codepointLength('abc')).toBe(3)
+    expect(codepointLength('😀😀')).toBe(2)
+    expect(codepointLength('内存')).toBe(2)
+    expect(sanitizeFtsText(`a${CJK_SEPARATOR}b`)).toBe('ab')
+    expect(sanitizeFtsText('plain')).toBe('plain')
   })
 
   it('canonicalizes request and filter ordering in both scopes', () => {

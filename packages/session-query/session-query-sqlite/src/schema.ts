@@ -4,8 +4,12 @@ import type { DatabaseSync } from 'node:sqlite'
 import { mkdir, open } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
-/** Current derived-index schema version. Incompatible versions reset in place. */
-export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 8
+/**
+ * Current derived-index schema version. Incompatible versions reset in place.
+ * Version 9 stores CJK runs as unigram+bigram token streams, which version-8
+ * indexes cannot answer.
+ */
+export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 9
 
 /** SQLite application id protecting unrelated databases from derived resets. */
 export const SESSION_QUERY_SQLITE_APPLICATION_ID = 0x44534851

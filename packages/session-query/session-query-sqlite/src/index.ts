@@ -5,10 +5,17 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto'
-import type { DatabaseSync } from 'node:sqlite'
+import type { Hash } from 'node:crypto'
+import type { DatabaseSync, StatementSync } from 'node:sqlite'
 import { Context, Service, type Fiber } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
+import { Session, foldSurface } from '@deepseek-ai/dsh-session'
+import type {
+  SessionEvent,
+  SessionHeader,
+  SessionId,
+  SurfaceFoldResult,
+} from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type {
   SessionPersistenceRevision,
@@ -20,11 +27,10 @@ import SessionQueryEngine, {
   SessionQueryError,
   SessionSearchCursor,
   assertSessionHeadersCompatible,
-  buildSessionEventSearchDocuments,
+  extractSessionEventText,
 } from '@deepseek-ai/dsh-session-query'
 import type {
   Config as SessionQueryConfig,
-  SessionEventSearchDocument,
   SessionEventSearchHit,
   SessionEventSearchPage,
   SessionEventSearchRequest,
@@ -46,14 +52,16 @@ import {
   assertFts5OuterPredicateCount,
   assertPortableBindingCount,
   buildEventWhere,
+  buildFtsQuery,
   buildSessionWhere,
+  codepointLength,
   makeSnippet,
   normalizeEventRequest,
   normalizeSessionRequest,
-  quoteFtsData,
   requestFingerprint,
   sanitizeFtsText,
   SQLITE_MAX_PAGE_LIMIT,
+  tokenizeSearchText,
 } from './query.ts'
 
 export {
@@ -81,6 +89,9 @@ export const SESSION_QUERY_SQLITE_SNIPPET_CHARS = 240
 
 // One transient source change gets a retry; repeated churn fails rather than monopolizing the queue.
 const STABLE_OBSERVATION_ATTEMPTS = 2
+
+/** Largest `seq IN (...)` list in one shadow-surface UPDATE statement. */
+const SQLITE_SHADOW_UPDATE_CHUNK = 500
 
 /** SQLite module/handle opening phase; `never` disables full-text search entirely. */
 export type OpenAt = 'startup' | 'first-search' | 'never'
@@ -124,16 +135,61 @@ interface ResolvedConfig {
   persistedInspectConcurrency: number
 }
 
-interface ObservedSession {
+/** One live session as observed for reconciliation: no log content is cloned. */
+interface ObservedLiveSession {
   header: SessionHeader
-  documents: SessionEventSearchDocument[]
+  session: Session
   fingerprint: string
+  /** Frozen event snapshot and its captured length at observation time. */
+  events: readonly SessionEvent[]
+  length: number
+  /** The session's incremental cache; writes and post-commit bookkeeping share it. */
+  cache: LiveIndexCache
+}
+
+/** One inspected persisted log, owned by the observation until its rows are written. */
+interface ObservedPersistedLoaded {
+  header: SessionHeader
+  events: readonly SessionEvent[]
+  fold: SurfaceFoldResult
 }
 
 interface ObservedPersistedSession {
   header: SessionHeader
   revision: SessionPersistenceRevision
-  loaded?: ObservedSession
+  loaded?: ObservedPersistedLoaded
+}
+
+/**
+ * Per-`Session` incremental observation state. Events are deep-frozen and the
+ * public snapshot array is replaced, never grown, on append, so a cached
+ * stream keyed by the snapshot's last event can only advance forward.
+ */
+interface LiveIndexCache {
+  /** Snapshot array the stream and fold were computed over. */
+  events: readonly SessionEvent[]
+  /** Number of events hashed into `stream` so far. */
+  length: number
+  /** Identity guard for the snapshot prefix: `events[length - 1]`. */
+  lastEvent: SessionEvent | undefined
+  /** Incremental SHA-256 stream over one event per `length` count. */
+  stream: Hash
+  /** Surface fold over `events`; recomputed only when the snapshot advances. */
+  fold: SurfaceFoldResult
+  /** Replacement operations the derived index has already applied. */
+  foldReplacements: number
+  /** Fingerprint last written to `temp.live_sessions`, when known. */
+  indexedFingerprint: string | undefined
+  /** Last event seq whose document was written to `temp.live_docs`, or -1. */
+  indexedSeq: number
+}
+
+/** Cache bookkeeping applied only after the reconcile transaction commits. */
+interface LiveCacheUpdate {
+  cache: LiveIndexCache
+  fingerprint: string
+  indexedSeq: number
+  foldReplacements: number
 }
 
 interface PersistenceBinding {
@@ -144,7 +200,7 @@ interface PersistenceBinding {
 interface Observation {
   persistenceBinding: PersistenceBinding
   persisted: Map<SessionId, ObservedPersistedSession>
-  live: Map<SessionId, ObservedSession>
+  live: Map<SessionId, ObservedLiveSession>
 }
 
 interface IndexedPersistedRow {
@@ -226,6 +282,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
   private _closed = false
   private _closePromise: Promise<void> | undefined
   private readonly _optionalPersistenceFiber: Fiber
+  private readonly _liveCaches = new WeakMap<Session, LiveIndexCache>()
 
   constructor(ctx: Context, config: Config) {
     // The assignment expression resolves before the base constructor can
@@ -433,10 +490,12 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
         entry,
         generation: nextLocalGeneration,
         persisted: observation.persisted.has(entry.header.id),
+        indexed: liveById.get(entry.header.id),
       }
     })
 
     if (hasWrites) {
+      const liveCacheUpdates: LiveCacheUpdate[] = []
       let began = false
       try {
         db.exec('BEGIN IMMEDIATE')
@@ -446,13 +505,16 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           /* v8 ignore next -- observation loads every entry whose revision differs */
           if (entry.loaded === undefined) throw new Error(`missing loaded revision for session "${entry.header.id}"`)
           this._replacePersistedSession(entry.loaded, entry.revision, nextMainGeneration)
+          // Drop the inspected log as soon as its rows are written: the
+          // derived index, not the observation, owns searchable content.
+          delete entry.loaded
         }
         if (persistentChanges.length > 0 || persistentDeletes.length > 0) {
           db.prepare('UPDATE search_state SET global_generation = ? WHERE singleton = 1').run(nextMainGeneration)
         }
         for (const row of liveDeletes) this._deleteSession('live', row.id as SessionId)
-        for (const { entry, generation, persisted } of liveReplacements) {
-          this._replaceLiveSession(entry, generation, persisted)
+        for (const { entry, generation, persisted, indexed } of liveReplacements) {
+          liveCacheUpdates.push(this._replaceLiveSession(entry, indexed, generation, persisted))
         }
         db.exec('COMMIT')
       } catch (error: unknown) {
@@ -470,6 +532,12 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           'SESSION_QUERY_INDEX_FAILED',
           { cause: error },
         )
+      }
+      // Cache bookkeeping must not claim committed rows on a rolled-back write.
+      for (const update of liveCacheUpdates) {
+        update.cache.indexedFingerprint = update.fingerprint
+        update.cache.indexedSeq = update.indexedSeq
+        update.cache.foldReplacements = update.foldReplacements
       }
     }
 
@@ -508,13 +576,21 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
             const loaded = await persistence.inspect(entry.header.id, signal)
             assertNotAborted(signal)
             assertSessionHeadersCompatible(entry.header, loaded.meta)
-            entry.loaded = observeSession(loaded.meta, loaded.events)
+            // `inspect()` hands over fresh detached values; documents are built
+            // once at write time, so nothing here clones or retains copies.
+            entry.loaded = { header: loaded.meta, events: loaded.events, fold: safeFoldSurface(loaded.events) }
           }
           assertNotAborted(signal)
           const afterSnapshots = await persistence.listSnapshots(signal)
           assertNotAborted(signal)
           const after = materializePersistenceSnapshots(afterSnapshots)
-          if (!samePersistenceSnapshots(persisted, after)) continue
+          // Live owners flush their persisted logs continuously, so their
+          // revisions churn by design while their indexed rows stay shadowed
+          // by the TEMP overlay. The stability comparison ignores them;
+          // retrying over their churn would starve every search on a corpus
+          // whose rebuild takes longer than the flush interval.
+          const liveIds = new Set(this.ctx.sessions.list().map(session => session.id))
+          if (!samePersistenceSnapshots(persisted, after, liveIds)) continue
           if (this._persistenceBinding !== persistenceBinding) continue
         } catch (error: unknown) {
           if (isAbort(error) || signal?.aborted) {
@@ -531,9 +607,9 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
           )
         }
       }
-      const live = new Map<SessionId, ObservedSession>()
+      const live = new Map<SessionId, ObservedLiveSession>()
       for (const session of this.ctx.sessions.list()) {
-        const observed = observeLive(session)
+        const observed = this._observeLive(session)
         const durable = persisted.get(session.id)
         if (durable !== undefined) assertSessionHeadersCompatible(observed.header, durable.header)
         live.set(session.id, observed)
@@ -545,6 +621,57 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       'session-search persistence observation did not stabilize after one retry',
       'SESSION_QUERY_PERSISTENCE_FAILED',
     )
+  }
+
+  /**
+   * Observe one live session without cloning or re-reading its log: the
+   * fingerprint stream advances only over events appended since the last
+   * observation, and the surface fold is recomputed only when the snapshot
+   * advanced. Events are deep-frozen and the snapshot array is replaced, never
+   * mutated, so cached hashes cannot drift.
+   */
+  private _observeLive(session: Session): ObservedLiveSession {
+    const events = session.events
+    let cache = this._liveCaches.get(session)
+    const prefixIntact = cache !== undefined
+      && (cache.length === 0 || events[cache.length - 1] === cache.lastEvent)
+    if (cache === undefined || !prefixIntact) {
+      cache = {
+        events,
+        length: 0,
+        lastEvent: undefined,
+        stream: createHash('sha256'),
+        fold: safeFoldSurface(events),
+        foldReplacements: 0,
+        indexedFingerprint: undefined,
+        indexedSeq: -1,
+      }
+      this._liveCaches.set(session, cache)
+    }
+    for (let index = cache.length; index < events.length; index++) {
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
+      const event = events[index]!
+      cache.stream.update('\n')
+      cache.stream.update(JSON.stringify(event))
+    }
+    if (cache.events !== events) {
+      cache.events = events
+      cache.fold = safeFoldSurface(events)
+    }
+    cache.length = events.length
+    cache.lastEvent = events[events.length - 1]
+    const fingerprint = cache.stream
+      .copy()
+      .update(JSON.stringify(session.header))
+      .digest('base64url')
+    return {
+      header: structuredClone(session.header),
+      session,
+      fingerprint,
+      events,
+      length: events.length,
+      cache,
+    }
   }
 
   private _mainGeneration(): number {
@@ -565,43 +692,70 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     }
   }
 
+  private _deleteLiveDocs(id: SessionId): void {
+    this._requireDb().prepare('DELETE FROM temp.live_docs WHERE session_id = ?').run(id)
+  }
+
   private _replacePersistedSession(
-    entry: ObservedSession,
+    loaded: ObservedPersistedLoaded,
     revision: SessionPersistenceRevision,
     generation: number,
   ): void {
-    this._deleteSession('persisted', entry.header.id)
+    this._deleteSession('persisted', loaded.header.id)
     const db = this._requireDb()
     db.prepare(`
       INSERT INTO persisted_sessions
         (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, revision, generation)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      ...headerBindings(entry.header),
+      ...headerBindings(loaded.header),
       revision,
       generation,
     )
+    const currentNodes = new Set(loaded.fold.nodes)
+    const shadowed = new Set<number>()
+    for (const replacement of loaded.fold.replacements) {
+      for (const seq of replacement.shadowedSeqs) shadowed.add(seq)
+    }
     const insert = db.prepare(`
       INSERT INTO persisted_docs (text, session_id, seq, type, time, surface, codepoint_length)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
-    for (const document of entry.documents) {
-      const text = sanitizeFtsText(document.text)
-      insert.run(
-        text,
-        document.sessionId,
-        document.seq,
-        document.type,
-        document.time,
-        document.surface,
-        Array.from(text).length,
+    for (const event of loaded.events) {
+      const text = extractSessionEventText(event)
+      if (text.length === 0) continue
+      insertDocument(
+        insert,
+        loaded.header.id,
+        event,
+        currentNodes.has(event.seq) ? 'current' : shadowed.has(event.seq) ? 'shadowed' : 'log-only',
+        tokenizeSearchText(sanitizeFtsText(text)),
       )
     }
   }
 
-  private _replaceLiveSession(entry: ObservedSession, generation: number, persisted: boolean): void {
-    this._deleteSession('live', entry.header.id)
+  /**
+   * Write one changed live session. When the cache still matches the indexed
+   * row, only documents appended since the last write are inserted and only
+   * newly shadowed older documents are updated; otherwise the session's rows
+   * are rebuilt. The returned cache update must be applied only after the
+   * owning transaction commits.
+   */
+  private _replaceLiveSession(
+    entry: ObservedLiveSession,
+    indexed: IndexedLiveRow | undefined,
+    generation: number,
+    persisted: boolean,
+  ): LiveCacheUpdate {
     const db = this._requireDb()
+    const cache = entry.cache
+    const fold = cache.fold
+    const canDelta = indexed !== undefined
+      && cache.indexedFingerprint === indexed.fingerprint
+      && cache.indexedSeq >= 0
+    const firstNewSeq = canDelta ? cache.indexedSeq + 1 : 0
+    if (!canDelta) this._deleteLiveDocs(entry.header.id)
+    db.prepare('DELETE FROM temp.live_sessions WHERE id = ?').run(entry.header.id)
     db.prepare(`
       INSERT INTO temp.live_sessions
         (id, version, created_at, cwd, parent_session, seed_length, delegation_depth, agent_preset, fingerprint, persisted, generation)
@@ -612,21 +766,50 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
       persisted ? 1 : 0,
       generation,
     )
+    const replacements = canDelta
+      ? fold.replacements.slice(cache.foldReplacements)
+      : fold.replacements
+    const shadowUpdates: number[] = []
+    const newlyShadowed = new Set<number>()
+    for (const replacement of replacements) {
+      for (const seq of replacement.shadowedSeqs) {
+        if (seq < firstNewSeq) shadowUpdates.push(seq)
+        else newlyShadowed.add(seq)
+      }
+    }
+    const currentNodes = new Set<number>()
+    for (const seq of fold.nodes) {
+      if (seq >= firstNewSeq) currentNodes.add(seq)
+    }
     const insert = db.prepare(`
       INSERT INTO temp.live_docs (text, session_id, seq, type, time, surface, codepoint_length)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `)
-    for (const document of entry.documents) {
-      const text = sanitizeFtsText(document.text)
-      insert.run(
-        text,
-        document.sessionId,
-        document.seq,
-        document.type,
-        document.time,
-        document.surface,
-        Array.from(text).length,
+    for (let index = firstNewSeq; index < entry.length; index++) {
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
+      const event = entry.events[index]!
+      const text = extractSessionEventText(event)
+      if (text.length === 0) continue
+      insertDocument(
+        insert,
+        entry.header.id,
+        event,
+        currentNodes.has(event.seq) ? 'current' : newlyShadowed.has(event.seq) ? 'shadowed' : 'log-only',
+        tokenizeSearchText(sanitizeFtsText(text)),
       )
+    }
+    for (let offset = 0; offset < shadowUpdates.length; offset += SQLITE_SHADOW_UPDATE_CHUNK) {
+      const chunk = shadowUpdates.slice(offset, offset + SQLITE_SHADOW_UPDATE_CHUNK)
+      db.prepare(`
+        UPDATE temp.live_docs SET surface = 'shadowed'
+        WHERE session_id = ? AND surface = 'current' AND seq IN (${chunk.map(() => '?').join(', ')})
+      `).run(entry.header.id, ...chunk)
+    }
+    return {
+      cache,
+      fingerprint: entry.fingerprint,
+      indexedSeq: entry.length - 1,
+      foldReplacements: fold.replacements.length,
     }
   }
 
@@ -641,7 +824,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     assertFts5OuterPredicateCount(sessionWhere.predicateCount + eventWhere.predicateCount)
     const where = [sessionWhere.sql, eventWhere.sql].filter(Boolean).join(' AND ')
     const bindings = [
-      ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined),
+      ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined, this.config.snippetChars),
       ...sessionWhere.params,
       ...eventWhere.params,
       request.limit + 1,
@@ -679,7 +862,7 @@ export class SqliteSessionQueryEngine extends SessionQueryEngine {
     assertFts5OuterPredicateCount(1 + eventWhere.predicateCount)
     const where = ['session_id = ?', eventWhere.sql].filter(Boolean).join(' AND ')
     const bindings = [
-      ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined),
+      ...selectedDocumentsParams(request.query, persistenceBinding.service !== undefined, this.config.snippetChars),
       request.sessionId,
       ...eventWhere.params,
       request.limit + 1,
@@ -797,7 +980,7 @@ function selectedDocumentsSql(): { sql: string } {
         pd.type AS type,
         CAST(pd.time AS INTEGER) AS time,
         pd.surface AS surface,
-        highlight(persisted_docs, 0, ?, ?) AS marked_text,
+        highlight(persisted_docs, 0, ?, ?) AS marked_full,
         CAST(pd.codepoint_length AS INTEGER) AS document_length
       FROM persisted_docs AS pd
       JOIN persisted_sessions AS ps ON ps.id = pd.session_id
@@ -820,25 +1003,41 @@ function selectedDocumentsSql(): { sql: string } {
         ld.type AS type,
         CAST(ld.time AS INTEGER) AS time,
         ld.surface AS surface,
-        highlight(live_docs, 0, ?, ?) AS marked_text,
+        highlight(live_docs, 0, ?, ?) AS marked_full,
         CAST(ld.codepoint_length AS INTEGER) AS document_length
       FROM temp.live_docs AS ld
       JOIN temp.live_sessions AS ls ON ls.id = ld.session_id
       WHERE live_docs MATCH ?
     ), matched AS (
-      SELECT *,
+      SELECT
+        session_id, version, created_at, cwd, parent_session, seed_length,
+        delegation_depth, agent_preset, live, persisted, seq, type, time, surface,
+        document_length,
+        CASE
+          WHEN instr(marked_full, ?) > 0
+          THEN substr(marked_full, max(1, instr(marked_full, ?) - ?), ?)
+          ELSE substr(marked_full, 1, ?)
+        END AS marked_text,
         (
-          length(CAST(marked_text AS BLOB))
-          - length(CAST(replace(marked_text, ?, '') AS BLOB))
+          length(CAST(marked_full AS BLOB))
+          - length(CAST(replace(marked_full, ?, '') AS BLOB))
         ) / ? AS match_count
       FROM candidates
     )`,
   }
 }
 
-function selectedDocumentsParams(query: string, persistenceVisible: boolean): Array<string | number> {
-  const expression = quoteFtsData(query)
+function selectedDocumentsParams(
+  query: string,
+  persistenceVisible: boolean,
+  snippetChars: number,
+): Array<string | number> {
+  const expression = buildFtsQuery(query)
   const visible = persistenceVisible ? 1 : 0
+  // Raw-code-point windows around the first highlight marker: decoding CJK
+  // runs shrinks text, so the window is deliberately wider than the snippet.
+  const before = snippetChars * 4 + 16
+  const window = snippetChars * 12 + 32
   return [
     FTS_HIGHLIGHT_START,
     FTS_HIGHLIGHT_END,
@@ -849,24 +1048,40 @@ function selectedDocumentsParams(query: string, persistenceVisible: boolean): Ar
     FTS_HIGHLIGHT_END,
     expression,
     FTS_HIGHLIGHT_START,
+    FTS_HIGHLIGHT_START,
+    before,
+    window,
+    window,
+    FTS_HIGHLIGHT_START,
     Buffer.byteLength(FTS_HIGHLIGHT_START, 'utf8'),
   ]
 }
 
-function observeLive(session: Session): ObservedSession {
-  return observeSession(session.header, session.events)
-}
-
-function observeSession(header: SessionHeader, events: readonly SessionEvent[]): ObservedSession {
-  const detachedHeader = structuredClone(header)
-  const detachedEvents = events.map(event => structuredClone(event))
-  return {
-    header: detachedHeader,
-    documents: buildSessionEventSearchDocuments(detachedHeader.id, detachedEvents),
-    fingerprint: createHash('sha256')
-      .update(JSON.stringify({ header: detachedHeader, events: detachedEvents }))
-      .digest('base64url'),
-  }
+/**
+ * Insert one extracted search document with tokenized text and its stored
+ * code-point length.
+ * @param insert - prepared `*_docs` INSERT statement.
+ * @param sessionId - session that owns the event.
+ * @param event - source event whose metadata becomes the document's.
+ * @param surface - folded surface the event occupies.
+ * @param text - sanitized, tokenized searchable text.
+ */
+function insertDocument(
+  insert: StatementSync,
+  sessionId: SessionId,
+  event: SessionEvent,
+  surface: SessionEventSearchHit['surface'],
+  text: string,
+): void {
+  insert.run(
+    text,
+    sessionId,
+    event.seq,
+    event.type,
+    event.time,
+    surface,
+    codepointLength(text),
+  )
 }
 
 function materializePersistenceSnapshots(
@@ -887,12 +1102,28 @@ function materializePersistenceSnapshots(
   return result
 }
 
+/** Fold one log and map surface violations to the search error contract. */
+function safeFoldSurface(events: readonly SessionEvent[]): SurfaceFoldResult {
+  try {
+    return foldSurface(events)
+  } catch (error: unknown) {
+    throw new SessionQueryError(
+      /* v8 ignore next -- foldSurface throws Error instances */
+      `invalid session surface: ${error instanceof Error ? error.message : 'unknown error'}`,
+      'SESSION_QUERY_INVALID_SURFACE',
+      { cause: error },
+    )
+  }
+}
+
 function samePersistenceSnapshots(
   before: ReadonlyMap<SessionId, ObservedPersistedSession>,
   after: ReadonlyMap<SessionId, ObservedPersistedSession>,
+  ignored: ReadonlySet<SessionId>,
 ): boolean {
   if (before.size !== after.size) return false
   for (const [id, first] of before) {
+    if (ignored.has(id)) continue
     const second = after.get(id)
     if (
       second === undefined
@@ -905,7 +1136,7 @@ function samePersistenceSnapshots(
 
 function sameSessionIds(
   before: ReadonlySet<SessionId>,
-  after: ReadonlyMap<SessionId, ObservedSession>,
+  after: ReadonlyMap<SessionId, ObservedLiveSession>,
 ): boolean {
   if (before.size !== after.size) return false
   for (const id of before) {

@@ -1,4 +1,4 @@
-/** Request normalization, parameterized predicates, and result presentation. */
+/** Request normalization, parameterized predicates, query tokenization, and result presentation. */
 
 import {
   SessionQueryError,
@@ -20,6 +20,9 @@ export const FTS_HIGHLIGHT_START = '\uFDD0'
 /** Collision-free marker inserted after an FTS5 match by `highlight()`. */
 export const FTS_HIGHLIGHT_END = '\uFDD1'
 
+/** Zero-width separator between adjacent CJK tokens in the FTS index. */
+export const CJK_SEPARATOR = '\u200B'
+
 /** Largest page size whose internal lookahead remains an exact SQLite integer binding. */
 export const SQLITE_MAX_PAGE_LIMIT = Number.MAX_SAFE_INTEGER - 1
 
@@ -28,6 +31,18 @@ export const SQLITE_PORTABLE_VARIABLE_LIMIT = 32_766
 
 /** Supported outer-predicate budget that keeps SQLite FTS5 MATCH usable. */
 export const SQLITE_FTS5_OUTER_PREDICATE_LIMIT = 14
+
+// BMP CJK blocks (Hiragana/Katakana, Unified Ideographs, compatibility forms)
+// plus the supplementary CJK ideograph planes.
+const CJK_CHAR = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u{20000}-\u{2ceaf}\u{2f800}-\u{2fa1f}]/u
+
+/** One Unicode letter or number: what the `unicode61` tokenizer keeps. */
+const WORD_CHAR = /[\p{L}\p{N}]/u
+
+/** Whether one code point belongs to a CJK block. */
+export function isCjkChar(character: string): boolean {
+  return CJK_CHAR.test(character)
+}
 
 /**
  * Reject prospective SQLite binding growth beyond the portable ceiling.
@@ -216,24 +231,143 @@ export function buildEventWhere(filters: readonly SessionEventMetadataFilter[]):
 }
 
 /**
- * Quote caller text as one FTS5 phrase so query syntax remains inert data.
+ * Compile a normalized caller query into one FTS5 expression whose terms are
+ * ANDed literal tokens. Each whitespace-separated term is quoted as data, so
+ * MATCH syntax such as `OR`, `NEAR`, and `*` never executes. A CJK term
+ * expands to the bigrams its index twin stores (a one-code-point term keeps
+ * its unigram), which makes Chinese and Japanese substrings searchable at any
+ * length.
  * @param query - normalized caller query.
- * @returns FTS5 expression containing one escaped literal phrase.
+ * @returns non-empty FTS5 expression; a punctuation-only query falls back to
+ *   one quoted whole-query phrase that matches nothing.
  */
-export function quoteFtsData(query: string): string {
-  return `"${query.replaceAll('"', '""')}"`
+export function buildFtsQuery(query: string): string {
+  const tokens: string[] = []
+  for (const term of query.split(' ')) {
+    if (term.length === 0) continue
+    tokens.push(...quoteFtsTerm(term))
+  }
+  return tokens.length === 0 ? quoteFtsPhrase(query) : tokens.join(' ')
 }
 
 /**
- * Remove reserved marker collisions before text enters FTS5 or MATCH.
+ * Quote one caller term, expanding CJK runs into the unigram/bigram tokens
+ * the index stores for the same runs.
+ * @param term - one whitespace-delimited query term.
+ * @returns one quoted phrase per searchable token.
+ */
+function quoteFtsTerm(term: string): string[] {
+  const tokens: string[] = []
+  let word = ''
+  let run = ''
+  const flushWord = (): void => {
+    if (word.length > 0) {
+      // `unicode61` drops characters outside letter/number categories, so a
+      // punctuation-only word can never match a stored token.
+      if (WORD_CHAR.test(word)) tokens.push(quoteFtsPhrase(word))
+      word = ''
+    }
+  }
+  const flushRun = (): void => {
+    if (run.length === 0) return
+    let first = ''
+    let count = 0
+    for (const character of run) {
+      if (count === 0) first = character
+      count += 1
+    }
+    if (count === 1) {
+      tokens.push(quoteFtsPhrase(first))
+    } else {
+      let previous = ''
+      for (const character of run) {
+        if (previous.length > 0) tokens.push(quoteFtsPhrase(previous + character))
+        previous = character
+      }
+    }
+    run = ''
+  }
+  for (const character of term) {
+    if (isCjkChar(character)) {
+      flushWord()
+      run += character
+    } else {
+      flushRun()
+      word += character
+    }
+  }
+  flushWord()
+  flushRun()
+  return tokens
+}
+
+/** Quote one FTS5 phrase so its content is data, never MATCH syntax. */
+function quoteFtsPhrase(phrase: string): string {
+  return `"${phrase.replaceAll('"', '""')}"`
+}
+
+/**
+ * Tokenize document text for `unicode61` indexing so CJK runs become
+ * searchable substrings: each run is stored as its unigram tokens followed by
+ * its bigram tokens, separated by {@link CJK_SEPARATOR}. The query twin in
+ * {@link buildFtsQuery} emits matching bigrams, so a query of any length
+ * matches inside a longer run. Non-CJK text passes through untouched.
+ * @param text - sanitized document text.
+ * @returns token stream for the FTS `text` column.
+ */
+export function tokenizeSearchText(text: string): string {
+  let out = ''
+  let run = ''
+  const flush = (): void => {
+    if (run.length === 0) return
+    // Unigram pass first: the display decoder reads the unigram prefix back.
+    for (const character of run) out += character + CJK_SEPARATOR
+    // Bigram pass second.
+    let previous = ''
+    for (const character of run) {
+      if (previous.length > 0) out += previous + character + CJK_SEPARATOR
+      previous = character
+    }
+    run = ''
+  }
+  for (const character of text) {
+    if (isCjkChar(character)) run += character
+    else {
+      flush()
+      out += character
+    }
+  }
+  flush()
+  return out
+}
+
+/**
+ * Remove reserved marker and separator collisions before text enters FTS5 or
+ * MATCH. Caller zero-width separators are dropped so they cannot fragment a
+ * CJK run into misreconstructed tokens.
  * @param text - extracted document text or normalized caller query.
  * @returns text with reserved noncharacters mapped to replacement characters.
  */
 export function sanitizeFtsText(text: string): string {
+  if (
+    !text.includes('\0')
+    && !text.includes(FTS_HIGHLIGHT_START)
+    && !text.includes(FTS_HIGHLIGHT_END)
+    && !text.includes(CJK_SEPARATOR)
+  ) return text
   return text
     .replaceAll('\0', '\uFFFD')
     .replaceAll(FTS_HIGHLIGHT_START, '\uFFFD')
     .replaceAll(FTS_HIGHLIGHT_END, '\uFFFD')
+    .replaceAll(CJK_SEPARATOR, '')
+}
+
+/** Count Unicode code points without materializing a code-point array. */
+export function codepointLength(text: string): number {
+  let count = 0
+  // The string iterator yields one item per code point and allocates nothing.
+  for (const _ of text) count += 1
+  return count
 }
 
 /**
@@ -262,12 +396,12 @@ export function requestFingerprint(request: NormalizedSessionRequest | Normalize
 
 /**
  * Build a whitespace-normalized excerpt no longer than `maxChars`.
- * @param markedText - complete document with FTS5 `highlight()` markers.
+ * @param markedText - bounded document window with FTS5 `highlight()` markers.
  * @param maxChars - maximum result length in Unicode code points.
- * @returns bounded plain-text snippet.
+ * @returns bounded plain-text snippet centered on the first match.
  */
 export function makeSnippet(markedText: string, maxChars: number): string {
-  const { text: clean, matchStart } = normalizeMarkedText(markedText)
+  const { text: clean, matchStart } = decodeMarkedText(markedText)
   const characters = Array.from(clean)
   if (characters.length <= maxChars) return clean
   if (maxChars === 1) return '…'
@@ -293,26 +427,155 @@ export function makeSnippet(markedText: string, maxChars: number): string {
   return `${prefix}${characters.slice(start, end).join('')}${suffix}`
 }
 
-function normalizeMarkedText(markedText: string): { text: string; matchStart: number } {
-  const characters: string[] = []
-  let matchStart: number | undefined
-  for (const character of markedText) {
-    if (character === FTS_HIGHLIGHT_START) {
-      matchStart ??= characters.length
-      continue
+/**
+ * Reconstruct display text from a tokenized, highlight-marked document
+ * window: complete CJK runs are read back from their unigram prefix, window
+ * fragments are anchored at the first marked token so they still show exact
+ * characters from the match on, zero-width separators vanish, whitespace
+ * collapses to single spaces, and the first marked position is reported in
+ * decoded code points.
+ * @param marked - SQLite `highlight()` output over tokenized text.
+ * @returns decoded text and the first marked code-point offset, or `-1`.
+ */
+export function decodeMarkedText(marked: string): { text: string; matchStart: number } {
+  const chunks: string[] = []
+  let codepoints = 0
+  let matchStart = -1
+  let lastSpace = true
+  let word = ''
+  let runTokens: { chars: string; marked: boolean }[] = []
+  let tokenChars = ''
+  let tokenMarked = false
+  let pendingMark = false
+
+  const emitTokenChars = (chars: string, marked: boolean): void => {
+    /* v8 ignore next -- every call site passes one non-empty token character */
+    if (chars.length === 0) return
+    if (marked && matchStart < 0) matchStart = codepoints
+    chunks.push(chars)
+    codepoints += codepointLength(chars)
+  }
+  const finishToken = (): void => {
+    if (tokenChars.length === 0) return
+    runTokens.push({ chars: tokenChars, marked: tokenMarked })
+    tokenChars = ''
+    tokenMarked = false
+  }
+  const flushRun = (): void => {
+    finishToken()
+    if (runTokens.length === 0) return
+    const runStart = codepoints
+    const bigramStart = runTokens.findIndex(token => codepointLength(token.chars) >= 2)
+    const unigramCount = bigramStart === -1 ? runTokens.length : bigramStart
+    const bigramCount = runTokens.length - unigramCount
+    if (unigramCount === bigramCount + 1) {
+      // A complete run: its unigram zone is the exact original text and the
+      // bigram zone duplicates it. Bigram marks land on the bigram's first
+      // character, which the unigram prefix reconstructs.
+      for (let index = 0; index < unigramCount; index++) {
+        // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
+        const token = runTokens[index]!
+        emitTokenChars(token.chars, token.marked)
+      }
+      for (let index = unigramCount; index < runTokens.length; index++) {
+        // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
+        const token = runTokens[index]!
+        if (token.marked && matchStart < 0) matchStart = runStart + index - unigramCount
+      }
+      runTokens = []
+      return
     }
-    if (character === FTS_HIGHLIGHT_END) continue
-    if (/\s/u.test(character)) {
-      if (characters.length > 0 && characters.at(-1) !== ' ') characters.push(' ')
+    // A window fragment: only part of the run's token stream is present.
+    // Anchor reconstruction at the first marked token so the snippet still
+    // centers on the match and shows exact characters from there on.
+    const markedUnigram = runTokens.slice(0, unigramCount).findIndex(token => token.marked)
+    if (markedUnigram !== -1) {
+      for (let index = markedUnigram; index < unigramCount; index++) {
+        // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
+        const token = runTokens[index]!
+        emitTokenChars(token.chars, token.marked)
+      }
+      runTokens = []
+      return
+    }
+    const markedBigram = runTokens.slice(unigramCount).findIndex(token => token.marked)
+    const anchor = markedBigram === -1 ? bigramStart : unigramCount + markedBigram
+    if (anchor < 0 || anchor >= runTokens.length) {
+      // A fragment inside the unigram zone: each unigram already is one exact
+      // character of the run.
+      for (const token of runTokens) emitTokenChars(token.chars, token.marked)
     } else {
-      characters.push(character)
+      // The anchor bigram contributes both of its characters; each later
+      // bigram contributes its tail. Together they spell the run suffix from
+      // the anchor's first character. The anchor is the first marked token,
+      // so no later mark can still matter for the snippet position.
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- the anchor index is bounds-checked above
+      const anchorChars = Array.from(runTokens[anchor]!.chars)
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- an anchored bigram token holds at least two code points
+      emitTokenChars(anchorChars[0]!, runTokens[anchor]!.marked)
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- an anchored bigram token holds at least two code points
+      emitTokenChars(anchorChars[1]!, false)
+      for (let index = anchor + 1; index < runTokens.length; index++) {
+        // oxlint-disable-next-line typescript/no-non-null-assertion -- bounded by the loop condition
+        const characters = Array.from(runTokens[index]!.chars)
+        // oxlint-disable-next-line typescript/no-non-null-assertion -- every token holds at least one character
+        emitTokenChars(characters[1] ?? characters[0]!, false)
+      }
+    }
+    runTokens = []
+  }
+  const flushWord = (): void => {
+    if (word.length === 0) return
+    emitTokenChars(word, tokenMarked)
+    word = ''
+    tokenMarked = false
+  }
+  const finishAll = (): void => {
+    flushWord()
+    flushRun()
+  }
+  const emitSpace = (): void => {
+    if (lastSpace || codepoints === 0) return
+    chunks.push(' ')
+    codepoints += 1
+    lastSpace = true
+  }
+  const startToken = (): void => {
+    tokenMarked = pendingMark
+    pendingMark = false
+  }
+
+  for (const character of marked) {
+    if (character === FTS_HIGHLIGHT_START) {
+      // A marker sits between run tokens; it never ends the surrounding run.
+      flushWord()
+      finishToken()
+      pendingMark = true
+    } else if (character === FTS_HIGHLIGHT_END) {
+      flushWord()
+      finishToken()
+      pendingMark = false
+    } else if (character === CJK_SEPARATOR) {
+      flushWord()
+      finishToken()
+    } else if (isCjkChar(character)) {
+      flushWord()
+      if (tokenChars.length === 0) startToken()
+      tokenChars += character
+      lastSpace = false
+    } else if (/\s/u.test(character)) {
+      finishAll()
+      emitSpace()
+    } else {
+      flushRun()
+      if (word.length === 0) startToken()
+      word += character
+      lastSpace = false
     }
   }
-  if (characters.at(-1) === ' ') characters.pop()
-  return {
-    text: characters.join(''),
-    matchStart: matchStart ?? 0,
-  }
+  finishAll()
+  if (chunks.at(-1) === ' ') chunks.pop()
+  return { text: chunks.join(''), matchStart }
 }
 
 function normalizeQuery(value: string): string {

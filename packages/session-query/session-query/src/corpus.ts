@@ -7,12 +7,17 @@ import type { SessionRecord } from './types.ts'
 import { SessionQueryError } from './config.ts'
 import { assertSessionHeadersCompatible } from './sources.ts'
 
-/** Detached source selected for one exact read. */
+/** Source selected for one exact read. */
 export interface LogicalSession {
   /** Cloned source header. */
   header: SessionHeader
-  /** Cloned raw event log. */
-  events: SessionEvent[]
+  /**
+   * Raw event log borrowed from the live frozen snapshot, or freshly
+   * inspected and owned by this read. Callers treat it as immutable and
+   * clone every value they retain: full-log copies are the OOM the corpus
+   * must never reintroduce.
+   */
+  events: readonly SessionEvent[]
 }
 
 /** Borrowed source visible only during one synchronous batch projection. */
@@ -77,13 +82,15 @@ export class SessionCorpus {
   }
 
   /**
-   * Load one logical source, preferring a detached live snapshot.
+   * Load one logical source, preferring a borrowed live snapshot.
    *
    * A known live target never consults persistence, so an optional backend's
-   * failure cannot make current in-memory history unreadable.
+   * failure cannot make current in-memory history unreadable. Events are the
+   * live session's frozen snapshot array (replaced, never mutated, on append)
+   * or freshly inspected values; the load never copies the whole log.
    * @param sessionId - session to resolve.
    * @param signal - optional cancellation for persisted source resolution.
-   * @returns detached live-preferred header and events.
+   * @returns live-preferred header and events, immutable for the duration of the read.
    */
   async load(sessionId: SessionId, signal?: AbortSignal): Promise<LogicalSession> {
     signal?.throwIfAborted()
@@ -107,12 +114,9 @@ export class SessionCorpus {
       return snapshot
     }
     assertSessionHeadersCompatible(loaded.meta, listed)
-    const snapshot = {
-      header: structuredClone(loaded.meta),
-      events: loaded.events.map(event => structuredClone(event)),
-    }
+    // inspect() hands over fresh detached values unique to this read.
     signal?.throwIfAborted()
-    return snapshot
+    return { header: structuredClone(loaded.meta), events: loaded.events }
   }
 
   /**
@@ -290,9 +294,12 @@ async function inspectPersisted(
 }
 
 function snapshotLive(session: Session): LogicalSession {
+  // `events` is the session's frozen snapshot array: safe to borrow because
+  // appends replace it and events themselves are deep-frozen. Cloning it
+  // would double a multi-million-event log for every exact read.
   return {
     header: structuredClone(session.header),
-    events: session.events.map(event => structuredClone(event)),
+    events: session.events,
   }
 }
 

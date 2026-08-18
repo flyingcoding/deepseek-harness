@@ -5,14 +5,19 @@ import { HarnessError } from '@deepseek-ai/dsh-llm'
 /** Default maximum `before`/`after` raw-event window. */
 export const SESSION_QUERY_READ_WINDOW_MAX = 50
 
-/** Default maximum number of concurrent persisted-log inspections in one batch read. */
-export const SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY = 4
+/**
+ * Default maximum number of concurrent persisted-log inspections in one batch
+ * read. One full inspected log can hold millions of events (hundreds of MB);
+ * a single concurrent worker keeps one batch read's peak at one log instead
+ * of `concurrency` logs. Deployments may trade memory for latency.
+ */
+export const SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY = 1
 
 /** Backend-independent configuration inherited by every session-query implementation. */
 export interface Config {
   /** Maximum accepted raw read context on either side. Defaults to 50. */
   readWindowMax?: number
-  /** Maximum concurrent persisted-log inspections in one batch read. Defaults to 4. */
+  /** Maximum concurrent persisted-log inspections in one batch read. Defaults to 1. */
   persistedInspectConcurrency?: number
 }
 

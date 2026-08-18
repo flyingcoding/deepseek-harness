@@ -582,7 +582,9 @@ describe('session-query exact reads', () => {
       events: [],
     }))
     TestPersistence.reset(entries)
-    const ctx = await liveContext()
+    // The discard-ordering property is observable only with several workers;
+    // the deployment default is 1, so the test pins its own width.
+    const ctx = await liveContext({ persistedInspectConcurrency: 4 })
     await ctx.plugin(TestPersistence)
     const timeline: string[] = []
     const releases = new Map<SessionIdType, () => void>()
