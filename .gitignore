@@ -39,3 +39,5 @@ apps/web/dist/
 worktrees/
 .agents/worktrees/
 .typert-*/
+/.reasonix/
+/reasonix.toml
