@@ -144,15 +144,17 @@ export function createApiRemoteAgentResolver(
     if (resume === undefined) {
       resume = (async () => {
         try {
-          const inspected = await inspectApiRemoteSession(ctx, sessionId)
-          if (hasApiRemoteSubagentOwner(ctx, { header: inspected.meta }, undefined)) {
+          const persistence = ctx.get('sessionPersistence')
+          if (persistence === undefined) {
+            throw new Error('session persistence is not configured (load a dsh-session-persistence backend)')
+          }
+          const meta = (await persistence.list()).find(candidate => candidate.id === sessionId)
+          if (meta === undefined || meta.cwd === undefined) {
+            throw new ApiRemoteSessionNotFound(`session "${sessionId}" not found`)
+          }
+          if (hasApiRemoteSubagentOwner(ctx, { header: meta }, undefined)) {
             throw new ApiRemoteSubagentSessionOwnership(sessionId)
           }
-          // Built from the inspected session before the published re-checks
-          // below, so those stay adjacent to `resume` and a Host setup that
-          // awaits (composing a preset, say) does not widen the collision
-          // window.
-          const setup = options.setup === undefined ? undefined : await options.setup(inspected)
           const publishedSession = ctx.sessions.get(sessionId)
           const publishedAgent = ctx.agents.get(sessionId)
           if (publishedSession !== undefined
@@ -162,7 +164,25 @@ export function createApiRemoteAgentResolver(
           const handle = await ctx.agents.resume({
             resumeSessionId: sessionId,
             ...options.agentOptions === undefined ? {} : { agentOptions: options.agentOptions() },
-            ...setup === undefined ? {} : { setup },
+            setup: async (agentCtx: Context) => {
+              const agent = agentCtx.agent
+              if (agent === undefined) {
+                throw new Error(`agent "${sessionId}" setup has no unpublished Agent association`)
+              }
+              if (agent.session.header.cwd === undefined) {
+                throw new ApiRemoteSessionNotFound(`session "${sessionId}" not found`)
+              }
+              if (hasApiRemoteSubagentOwner(ctx, agent.session, undefined)) {
+                throw new ApiRemoteSubagentSessionOwnership(sessionId)
+              }
+              if (options.setup !== undefined) {
+                const setup = await options.setup({
+                  meta: agent.session.header,
+                  events: agent.session.events,
+                })
+                return setup(agentCtx)
+              }
+            },
           })
           return handle.agent
         } finally {

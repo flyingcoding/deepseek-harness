@@ -15,7 +15,8 @@ import { performance } from 'node:perf_hooks'
 import { scheduler } from 'node:timers/promises'
 import { randomBytes } from 'node:crypto'
 import {
-  DEFAULT_PREPARED_SESSION_CACHE_SIZE, DEFAULT_WRITE_BATCH_MAX_DELAY_MS, MAX_WRITE_BATCH_DELAY_MS,
+  DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS, DEFAULT_PREPARED_SESSION_CACHE_SIZE,
+  DEFAULT_WRITE_BATCH_MAX_DELAY_MS, MAX_WRITE_BATCH_DELAY_MS,
   SessionPersistence, SessionPersistenceRevision, PersistenceCoordinator, SessionFormatUnsupportedError,
   type PersistenceBackend, type SessionLocation, type SessionPersistenceSnapshot,
   type SessionInspection, type SessionPersistenceRevision as PersistenceRevision, type SessionRawArtifact,
@@ -78,6 +79,8 @@ export interface Config {
   compression?: JsonlCompression
   /** Maximum cold Session preparations retained for history-to-resume reuse. */
   preparedSessionCacheSize?: number
+  /** Maximum logical events retained across cold Session preparations. */
+  preparedSessionCacheMaxEvents?: number
   /** Fixed live-event coalescing window; not a backend completion deadline. */
   writeBatchMaxDelayMs?: number
 }
@@ -128,6 +131,8 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     packChunks: z.boolean().default(DEFAULT_PACK_CHUNKS),
     compression: JsonlCompressionSchema,
     preparedSessionCacheSize: z.number().step(1).min(1).default(DEFAULT_PREPARED_SESSION_CACHE_SIZE),
+    preparedSessionCacheMaxEvents: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER)
+      .default(DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS),
     writeBatchMaxDelayMs: z.number().step(1).min(1).max(MAX_WRITE_BATCH_DELAY_MS)
       .default(DEFAULT_WRITE_BATCH_MAX_DELAY_MS),
   })
@@ -152,6 +157,8 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     // Programmatic wrappers may construct the backend without Schemastery normalization.
     const preparedSessionCacheSize = config.preparedSessionCacheSize
       ?? DEFAULT_PREPARED_SESSION_CACHE_SIZE
+    const preparedSessionCacheMaxEvents = config.preparedSessionCacheMaxEvents
+      ?? DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS
     const writeBatchMaxDelayMs = config.writeBatchMaxDelayMs
       ?? DEFAULT_WRITE_BATCH_MAX_DELAY_MS
     this.packChunks = config.packChunks ?? DEFAULT_PACK_CHUNKS
@@ -159,6 +166,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     this.assertUsableRoot()
     this.coordinator = new PersistenceCoordinator<JsonlTornMarker>(this.ctx, this, {
       preparedSessionCacheSize,
+      preparedSessionCacheMaxEvents,
       writeBatchMaxDelayMs,
     })
   }

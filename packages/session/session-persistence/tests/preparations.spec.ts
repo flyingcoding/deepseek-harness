@@ -9,8 +9,10 @@ interface PreparedSource {
   readonly label: string
 }
 
-function prepared(label: string): PreparedSource {
-  return { session: Session.create(SessionId(label)), label }
+function prepared(label: string, eventCount = 0): PreparedSource {
+  const session = Session.create(SessionId(label))
+  for (let index = 0; index < eventCount; index++) session.append('session/end-seed', {})
+  return { session, label }
 }
 
 function committed(source: PreparedSource): Promise<{ source: PreparedSource; state: string }> {
@@ -82,6 +84,33 @@ describe('SessionPreparations inspection', () => {
 
     expect(preparations.has(firstId)).toBe(false)
     expect(preparations.has(secondId)).toBe(true)
+  })
+
+  it('evicts ready sources until their total logical event count fits', async () => {
+    const preparations = new SessionPreparations<PreparedSource, string>(5, 3)
+    const firstId = SessionId('weighted-first')
+    const secondId = SessionId('weighted-second')
+    const firstLoad = vi.fn(() => Promise.resolve(prepared(firstId, 2)))
+    const secondLoad = vi.fn(() => Promise.resolve(prepared(secondId, 2)))
+
+    await preparations.inspect(firstId, firstLoad)
+    await preparations.inspect(secondId, secondLoad)
+    expect(preparations.has(firstId)).toBe(false)
+    expect(preparations.has(secondId)).toBe(true)
+
+    await preparations.inspect(firstId, firstLoad)
+    expect(firstLoad).toHaveBeenCalledTimes(2)
+    expect(preparations.has(firstId)).toBe(true)
+    expect(preparations.has(secondId)).toBe(false)
+  })
+
+  it('returns an oversized inspection without retaining it', async () => {
+    const preparations = new SessionPreparations<PreparedSource, string>(5, 1)
+    const id = SessionId('weighted-oversized')
+    const source = prepared(id, 2)
+
+    await expect(preparations.inspect(id, () => Promise.resolve(source))).resolves.toBe(source)
+    expect(preparations.has(id)).toBe(false)
   })
 
   it('removes failed and invalidated in-flight loads without changing their observers', async () => {

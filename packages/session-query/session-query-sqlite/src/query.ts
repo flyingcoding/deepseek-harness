@@ -39,7 +39,11 @@ const CJK_CHAR = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u{20000}
 /** One Unicode letter or number: what the `unicode61` tokenizer keeps. */
 const WORD_CHAR = /[\p{L}\p{N}]/u
 
-/** Whether one code point belongs to a CJK block. */
+/**
+ * Whether one code point belongs to a CJK block.
+ * @param character - one Unicode code point to classify.
+ * @returns whether the code point belongs to a supported CJK block.
+ */
 export function isCjkChar(character: string): boolean {
   return CJK_CHAR.test(character)
 }
@@ -362,7 +366,11 @@ export function sanitizeFtsText(text: string): string {
     .replaceAll(CJK_SEPARATOR, '')
 }
 
-/** Count Unicode code points without materializing a code-point array. */
+/**
+ * Count Unicode code points without materializing a code-point array.
+ * @param text - text whose code points are counted.
+ * @returns the number of Unicode code points.
+ */
 export function codepointLength(text: string): number {
   let count = 0
   // The string iterator yields one item per code point and allocates nothing.

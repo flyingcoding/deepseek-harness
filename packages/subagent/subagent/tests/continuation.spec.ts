@@ -514,9 +514,13 @@ describe('SubagentRuntime.followup residency routing', () => {
     const { ctx, parent } = await setup([textResponse('first'), textResponse('after resume')])
     const started = await ctx.subagents.startContinuable(startSpec(parent))
     await waitNoActivation(ctx, started.childId)
+    const inspect = vi.spyOn(ctx.sessionPersistence, 'inspect')
+    const readFrom = vi.spyOn(ctx.sessionPersistence, 'readFrom')
 
     const messageId = await followup(ctx, parent, started.childId, message('continue please'))
     expect(messageId).toBeTypeOf('string')
+    expect(readFrom).toHaveBeenCalledWith(started.childId, 0, testSignal)
+    expect(inspect).not.toHaveBeenCalled()
     await waitNoActivation(ctx, started.childId)
 
     const loaded = await ctx.sessionPersistence.load(started.childId)
@@ -630,18 +634,18 @@ describe('SubagentRuntime.followup residency routing', () => {
       .rejects.toMatchObject({ code: 'NOT_RESUMABLE' })
   })
 
-  it('propagates cancellation while inspecting a cold child', async () => {
+  it('propagates cancellation while reading a cold child descriptor suffix', async () => {
     const { ctx, parent } = await setup([textResponse('first')])
     const started = await ctx.subagents.startContinuable(startSpec(parent))
     await waitNoActivation(ctx, started.childId)
-    const inspectStarted = Promise.withResolvers<undefined>()
-    const inspect = vi.spyOn(ctx.sessionPersistence, 'inspect').mockImplementation((_id, signal) => {
+    const readStarted = Promise.withResolvers<undefined>()
+    const readFrom = vi.spyOn(ctx.sessionPersistence, 'readFrom').mockImplementation((_id, _fromSeq, signal) => {
       return new Promise<never>((_resolve, reject) => {
         if (signal === undefined) {
-          reject(new Error('cold inspection must receive the followup signal'))
+          reject(new Error('cold descriptor read must receive the followup signal'))
           return
         }
-        inspectStarted.resolve(undefined)
+        readStarted.resolve(undefined)
         signal.addEventListener('abort', () => {
           reject(reason)
         }, { once: true })
@@ -652,11 +656,11 @@ describe('SubagentRuntime.followup residency routing', () => {
 
     try {
       const delivery = followup(ctx, parent, started.childId, message('cancel me'), controller.signal)
-      await inspectStarted.promise
+      await readStarted.promise
       controller.abort(reason)
       await expect(delivery).rejects.toBe(reason)
     } finally {
-      inspect.mockRestore()
+      readFrom.mockRestore()
     }
   })
 

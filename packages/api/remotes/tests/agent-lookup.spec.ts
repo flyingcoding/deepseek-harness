@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
 import SessionStore from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
 import { createApiRemoteAgentResolver } from '@deepseek-ai/dsh-api-remotes'
@@ -25,7 +25,7 @@ async function createContext(): Promise<Context> {
 function provideSession(
   ctx: Context,
   meta: SessionHeader,
-  inspect: () => Promise<{ meta: SessionHeader; events: SessionEvent[] }>,
+  inspect: () => Promise<{ meta: SessionHeader; events: SessionEvent[] }> = () => Promise.resolve({ meta, events: [] }),
 ): void {
   ctx.provide('sessionPersistence', {
     list: () => Promise.resolve([meta]),
@@ -39,18 +39,17 @@ function stubAgent(ctx: Context, session: Session): Agent {
 }
 
 describe('API Remote Agent resolver races', () => {
-  it('maps an inspected session without a cwd to session-not-found', async () => {
+  it('maps a listed session without a cwd to session-not-found', async () => {
     const ctx = await createContext()
     const sessionId = sid('missing-after-inspect')
-    const meta = header(sessionId)
-    provideSession(ctx, meta, () => Promise.resolve({
-      meta: { ...meta, cwd: undefined } as unknown as SessionHeader,
-      events: [],
-    }))
+    const meta = { ...header(sessionId), cwd: undefined } as unknown as SessionHeader
+    const inspect = vi.fn(() => Promise.resolve({ meta, events: [] }))
+    provideSession(ctx, meta, inspect)
 
     const result = await createApiRemoteAgentResolver(ctx, {})(sessionId)
 
     expect(result).toMatchObject({ error: { code: 'session-not-found', details: { sessionId } } })
+    expect(inspect).not.toHaveBeenCalled()
     await ctx.fiber.dispose()
   })
 
@@ -58,31 +57,26 @@ describe('API Remote Agent resolver races', () => {
     const ctx = await createContext()
     const sessionId = sid('ordinary-attach-race')
     const meta = header(sessionId)
-    let published: Session | undefined
-    provideSession(ctx, meta, () => {
-      published = ctx.sessions.create(sessionId, { meta: { cwd: '/proj' } })
-      return Promise.resolve({ meta, events: [] })
-    })
+    provideSession(ctx, meta)
     const resume = vi.spyOn(ctx.agents, 'resume').mockImplementation(async () => {
-      if (published === undefined) throw new Error('Session was not published')
+      const published = ctx.sessions.create(sessionId, { meta: { cwd: '/proj' } })
       return { agent: stubAgent(ctx, published), dispose: () => Promise.resolve() }
     })
 
     const result = await createApiRemoteAgentResolver(ctx, {})(sessionId)
 
     expect(result).toMatchObject({ agent: { id: sessionId } })
-    expect(resume).toHaveBeenCalledWith({ resumeSessionId: sessionId })
+    expect(resume).toHaveBeenCalledOnce()
+    expect(resume.mock.calls[0]?.[0].resumeSessionId).toBe(sessionId)
+    expect(typeof resume.mock.calls[0]?.[0].setup).toBe('function')
     await ctx.fiber.dispose()
   })
 
-  it('rejects a subagent Session published after durable inspection', async () => {
+  it('rejects a listed subagent Session before resume', async () => {
     const ctx = await createContext()
     const sessionId = sid('owned-attach-race')
-    const meta = header(sessionId)
-    provideSession(ctx, meta, () => {
-      ctx.sessions.create(sessionId, { meta: { cwd: '/proj', origin: 'subagent' } })
-      return Promise.resolve({ meta, events: [] })
-    })
+    const meta = { ...header(sessionId), origin: 'subagent' as const }
+    provideSession(ctx, meta)
     const resume = vi.spyOn(ctx.agents, 'resume')
 
     const result = await createApiRemoteAgentResolver(ctx, {})(sessionId)
@@ -97,7 +91,7 @@ describe('API Remote Agent resolver races', () => {
       const ctx = await createContext()
       const sessionId = sid(`owned-${winner}-resume-race`)
       const meta = header(sessionId)
-      provideSession(ctx, meta, () => Promise.resolve({ meta, events: [] }))
+      provideSession(ctx, meta)
       vi.spyOn(ctx.agents, 'resume').mockImplementationOnce(async () => {
         const session = ctx.sessions.create(sessionId, { meta: { cwd: '/proj', origin: 'subagent' } })
         if (winner === 'agent') ctx.agents.register(stubAgent(ctx, session))
@@ -115,14 +109,10 @@ describe('API Remote Agent resolver races', () => {
     const ctx = await createContext()
     const sessionId = sid('context-cold-resume')
     const meta = header(sessionId)
-    let published: Session | undefined
-    provideSession(ctx, meta, () => {
-      published = ctx.sessions.create(sessionId, { meta: { cwd: '/proj' } })
-      return Promise.resolve({ meta, events: [] })
-    })
+    provideSession(ctx, meta)
     const agentCtx = ctx.extend()
     vi.spyOn(ctx.agents, 'resume').mockImplementation(async () => {
-      if (published === undefined) throw new Error('Session was not published')
+      const published = ctx.sessions.create(sessionId, { meta: { cwd: '/proj' } })
       return { agent: stubAgent(agentCtx, published), dispose: () => Promise.resolve() }
     })
     const defaultProvider = ctx.typert.contexts.getHost('agent')
@@ -132,6 +122,36 @@ describe('API Remote Agent resolver races', () => {
     if (provider === undefined) throw new Error('Agent Host Context provider was not mounted')
 
     await expect(provider.resolve(sessionId)).resolves.toBe(agentCtx)
+    await ctx.fiber.dispose()
+  })
+
+  it('builds setup from the resumed Session without a prior inspection', async () => {
+    const ctx = await createContext()
+    const sessionId = sid('single-materialization-setup')
+    const meta = header(sessionId)
+    const inspect = vi.fn(() => Promise.resolve({ meta, events: [] }))
+    provideSession(ctx, meta, inspect)
+    const seen: number[] = []
+    vi.spyOn(ctx.agents, 'resume').mockImplementation(async (
+      options: ResumeAgentOptions,
+    ): Promise<AgentHandle> => {
+      const session = ctx.sessions.create(sessionId, { meta: { cwd: '/proj' } })
+      session.append('session/end-seed', {})
+      const agent = stubAgent(ctx.extend(), session)
+      Object.defineProperty(agent.ctx, 'agent', { value: agent, configurable: true })
+      await options.setup?.(agent.ctx)
+      return { agent, dispose: () => Promise.resolve() }
+    })
+    const resolve = createApiRemoteAgentResolver(ctx, {
+      setup: ({ events }) => (agentCtx) => {
+        expect(agentCtx.agent?.id).toBe(sessionId)
+        seen.push(events.length)
+      },
+    })
+
+    await expect(resolve(sessionId)).resolves.toMatchObject({ agent: { id: sessionId } })
+    expect(inspect).not.toHaveBeenCalled()
+    expect(seen).toEqual([1])
     await ctx.fiber.dispose()
   })
 

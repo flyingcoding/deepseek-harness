@@ -1577,28 +1577,37 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           ? undefined
           : (await persistence.list()).find(header => header.id === sessionId)
         if (persistence !== undefined && stored !== undefined) {
-          const inspected = await persistence.inspect(sessionId)
           // Ownership first: explicit-id adoption of a session-backed
           // subagent must answer `agent-busy` regardless of the requested
           // cwd (the api/commands.ts contract), not a cwd conflict.
-          if (hasSubagentOwner({ header: inspected.meta }, undefined)) {
+          if (hasSubagentOwner({ header: stored }, undefined)) {
             throw new SubagentSessionOwnership(sessionId)
           }
-          if (inspected.meta.cwd !== cwd) {
-            throw new SessionCwdConflict(sessionId, cwd, inspected.meta.cwd)
+          if (stored.cwd !== cwd) {
+            throw new SessionCwdConflict(sessionId, cwd, stored.cwd)
           }
-          // Resolved from the log, not the header: a session that switched
-          // while blank ran every turn under the newer composition.
-          const storedPreset = resolveSessionPreset({ header: inspected.meta, events: inspected.events })
-          assertPresetUnchanged(sessionId, presetId, storedPreset)
-          // The stored preset wins over anything the request names: a resumed
-          // session's history was produced under that composition, and
-          // rebuilding it differently would replay tool calls the model can no
-          // longer make.
           return (await ctx.agents.resume({
             resumeSessionId: sessionId,
             agentOptions: agentOptions(),
-            setup: (await composeAgent(storedPreset)).setup,
+            setup: async (agentCtx: Context) => {
+              const agent = agentCtx.agent
+              if (agent === undefined) {
+                throw new Error(`agent "${sessionId}" setup has no unpublished Agent association`)
+              }
+              if (hasSubagentOwner(agent.session, undefined)) {
+                throw new SubagentSessionOwnership(sessionId)
+              }
+              if (agent.session.header.cwd !== cwd) {
+                throw new SessionCwdConflict(sessionId, cwd, agent.session.header.cwd)
+              }
+              // Resolved from the restored log, not the header: a session that
+              // switched while blank ran every turn under the newer composition.
+              const storedPreset = resolveSessionPreset(agent.session)
+              assertPresetUnchanged(sessionId, presetId, storedPreset)
+              // The stored preset wins over anything the request names: a resumed
+              // session's history was produced under that composition.
+              await (await composeAgent(storedPreset)).setup(agentCtx)
+            },
           })).agent
         }
 

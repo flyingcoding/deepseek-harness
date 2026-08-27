@@ -26,6 +26,9 @@ import { SessionWriteBehind } from './write-behind.ts'
 /** Default number of detached session preparations retained by a coordinator. */
 export const DEFAULT_PREPARED_SESSION_CACHE_SIZE = 5
 
+/** Default total logical events retained across detached session preparations. */
+export const DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS = 1_000_000
+
 /** Default maximum intentional wait before a live session batch starts writing. */
 export const DEFAULT_WRITE_BATCH_MAX_DELAY_MS = 200
 
@@ -84,6 +87,8 @@ export function sessionFormatVersionRefusal(id: string, version: number): string
 export interface PersistenceCoordinatorOptions {
   /** Maximum completed unpublished preparations retained for reuse. */
   readonly preparedSessionCacheSize: number
+  /** Maximum logical events retained across completed unpublished preparations. */
+  readonly preparedSessionCacheMaxEvents?: number
   /** Maximum intentional batching wait after an idle live queue receives work. */
   readonly writeBatchMaxDelayMs: number
 }
@@ -607,6 +612,7 @@ export class PersistenceCoordinator<TornMarker = unknown> {
     private backend: PersistenceBackend<TornMarker>,
     options: PersistenceCoordinatorOptions = {
       preparedSessionCacheSize: DEFAULT_PREPARED_SESSION_CACHE_SIZE,
+      preparedSessionCacheMaxEvents: DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS,
       writeBatchMaxDelayMs: DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
     },
   ) {
@@ -614,13 +620,22 @@ export class PersistenceCoordinator<TornMarker = unknown> {
       || options.preparedSessionCacheSize < 1) {
       throw new TypeError('preparedSessionCacheSize must be a positive safe integer')
     }
+    const preparedSessionCacheMaxEvents = options.preparedSessionCacheMaxEvents
+      ?? DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS
+    if (!Number.isSafeInteger(preparedSessionCacheMaxEvents)
+      || preparedSessionCacheMaxEvents < 1) {
+      throw new TypeError('preparedSessionCacheMaxEvents must be a positive safe integer')
+    }
     if (!Number.isSafeInteger(options.writeBatchMaxDelayMs)
       || options.writeBatchMaxDelayMs < 1
       || options.writeBatchMaxDelayMs > MAX_WRITE_BATCH_DELAY_MS) {
       throw new TypeError(`writeBatchMaxDelayMs must be an integer between 1 and ${MAX_WRITE_BATCH_DELAY_MS}`)
     }
     this.writeBatchMaxDelayMs = options.writeBatchMaxDelayMs
-    this.preparations = new SessionPreparations(options.preparedSessionCacheSize)
+    this.preparations = new SessionPreparations(
+      options.preparedSessionCacheSize,
+      preparedSessionCacheMaxEvents,
+    )
     this.installWritePath()
   }
 

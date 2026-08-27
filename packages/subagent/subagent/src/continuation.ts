@@ -936,11 +936,12 @@ export class SubagentContinuationManager {
   }
 
   /**
-   * Cold-resume a persisted child: inspect and authorize its Session, fold the
-   * generic descriptor, create the Activation through `ctx.agents.resume()`,
-   * and submit the waiting turn. This never dispatches through a subagent
-   * provider — the persisted Session already holds the initial prefix and the
-   * descriptor is the whole reconstruction input.
+   * Cold-resume a persisted child: read and authorize its descriptor suffix,
+   * create the Activation through `ctx.agents.resume()`, and submit the waiting
+   * turn. The detached suffix avoids retaining a second complete Session while
+   * resume materializes a multi-million-event child. This never dispatches
+   * through a subagent provider — the persisted Session already holds the
+   * initial prefix and the descriptor is the whole reconstruction input.
    */
   private async coldResume(
     parent: Agent,
@@ -949,9 +950,12 @@ export class SubagentContinuationManager {
     options: SubagentFollowupOptions,
   ): Promise<MessageId> {
     const persistence = this.requirePersistence()
-    let loaded: Awaited<ReturnType<typeof persistence.inspect>>
+    let loaded: Awaited<ReturnType<typeof persistence.readFrom>>
     try {
-      loaded = await persistence.inspect(childId, options.signal)
+      const listed = (await persistence.list(options.signal))
+        .find(candidate => candidate.id === childId)
+      if (listed === undefined) throw new Error('session is not persisted')
+      loaded = await persistence.readFrom(childId, listed.seedLength ?? 0, options.signal)
     } catch (error: unknown) {
       options.signal.throwIfAborted()
       throw new SubagentError(`subagent "${childId}" is unavailable`, 'NOT_RESUMABLE', { cause: error })
@@ -961,10 +965,9 @@ export class SubagentContinuationManager {
     // Authorize the persisted header before folding: only the durable child's
     // exact live direct parent may continue it.
     this.authorizeLineage(parent, childId, loaded.meta.parentSession)
-    // Fold only the child's own suffix: a fork seed replays the parent's log,
-    // which may carry an ANCESTOR's descriptor when the parent is itself a
-    // continuable child.
-    const descriptor = foldSubagentDescriptor(loaded.events.slice(loaded.meta.seedLength ?? 0))
+    // readFrom starts at the child's own suffix: a fork seed may carry an
+    // ancestor's descriptor when the parent is itself a continuable child.
+    const descriptor = foldSubagentDescriptor(loaded.events)
     if (descriptor === undefined || descriptor.mode !== 'continuable') {
       throw new SubagentError(
         `subagent "${childId}" has no supported continuation state and cannot be resumed; `

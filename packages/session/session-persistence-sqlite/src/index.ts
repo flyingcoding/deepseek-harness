@@ -13,6 +13,7 @@ import type {
   SessionPreparation,
 } from '@deepseek-ai/dsh-session'
 import {
+  DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS,
   DEFAULT_PREPARED_SESSION_CACHE_SIZE,
   DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
   MAX_WRITE_BATCH_DELAY_MS,
@@ -42,6 +43,8 @@ export interface Config {
   busyTimeoutMs?: number
   /** Maximum cold Session preparations retained for history-to-resume reuse. */
   preparedSessionCacheSize?: number
+  /** Maximum logical events retained across cold Session preparations. */
+  preparedSessionCacheMaxEvents?: number
   /** Fixed live-event coalescing window; not a backend completion deadline. */
   writeBatchMaxDelayMs?: number
 }
@@ -60,6 +63,8 @@ export class SqliteSessionPersistence extends SessionPersistence {
     journalMode: z.union(['wal', 'delete', 'truncate', 'persist'] as const).default('wal'),
     busyTimeoutMs: z.number().step(1).min(0).max(MAX_BUSY_TIMEOUT_MS).default(DEFAULT_BUSY_TIMEOUT_MS),
     preparedSessionCacheSize: z.number().step(1).min(1).default(DEFAULT_PREPARED_SESSION_CACHE_SIZE),
+    preparedSessionCacheMaxEvents: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER)
+      .default(DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS),
     writeBatchMaxDelayMs: z.number().step(1).min(1).max(MAX_WRITE_BATCH_DELAY_MS)
       .default(DEFAULT_WRITE_BATCH_MAX_DELAY_MS),
   })
@@ -71,6 +76,8 @@ export class SqliteSessionPersistence extends SessionPersistence {
     super(ctx)
     const preparedSessionCacheSize = config.preparedSessionCacheSize
       ?? DEFAULT_PREPARED_SESSION_CACHE_SIZE
+    const preparedSessionCacheMaxEvents = config.preparedSessionCacheMaxEvents
+      ?? DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS
     const writeBatchMaxDelayMs = config.writeBatchMaxDelayMs
       ?? DEFAULT_WRITE_BATCH_MAX_DELAY_MS
     this.store = new SqliteStore({
@@ -80,6 +87,7 @@ export class SqliteSessionPersistence extends SessionPersistence {
     })
     this.coordinator = new PersistenceCoordinator(this.ctx, this.store, {
       preparedSessionCacheSize,
+      preparedSessionCacheMaxEvents,
       writeBatchMaxDelayMs,
     })
   }

@@ -364,7 +364,7 @@ describe('Remote Agent and Session lookup policy', () => {
 
     await expect(resolvedAgent).resolves.toBe(resumedAgent)
     await expect(resolvedSession).resolves.toBe(resumedSession)
-    expect(inspect).toHaveBeenCalledOnce()
+    expect(inspect).not.toHaveBeenCalled()
   })
 
   it('preserves the subagent ownership fence for cold and live Remote lookups', async () => {
@@ -414,7 +414,7 @@ describe('Remote Agent and Session lookup policy', () => {
     await expect(liveFailure).rejects.toBeInstanceOf(TypertLookupFailure)
     await expect(liveFailure).rejects.toMatchObject(ownershipFailure)
     expect(resume).not.toHaveBeenCalled()
-    expect(inspect).toHaveBeenCalledOnce()
+    expect(inspect).not.toHaveBeenCalled()
   })
 })
 
@@ -481,7 +481,7 @@ describe('subagent ownership fence', () => {
     if (!create.result.ok) expect(create.result.error.code).toBe('agent-busy')
     expect(resume).not.toHaveBeenCalled()
     expect(ctx.agents.get(sessionId)).toBeUndefined()
-    expect(inspect).toHaveBeenCalledTimes(3)
+    expect(inspect).toHaveBeenCalledOnce()
   })
 
   it('no longer treats a descriptor-only cold child without origin as subagent-owned', async () => {

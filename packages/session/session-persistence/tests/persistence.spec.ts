@@ -503,6 +503,20 @@ describe('PersistenceCoordinator session preparations', () => {
     })).toThrow(/positive safe integer/)
   })
 
+  it.each([0, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid preparation cache event capacity %s',
+    (capacity) => {
+      const ctx = new Context()
+      const backend = new ControlledBackend()
+
+      expect(() => new PersistenceCoordinator(ctx, backend, {
+        preparedSessionCacheSize: DEFAULT_PREPARED_SESSION_CACHE_SIZE,
+        preparedSessionCacheMaxEvents: capacity,
+        writeBatchMaxDelayMs: DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
+      })).toThrow(/preparedSessionCacheMaxEvents must be a positive safe integer/)
+    },
+  )
+
   it.each([0, 1.5, MAX_WRITE_BATCH_DELAY_MS + 1])('rejects invalid write batch delay %s', (delay) => {
     const ctx = new Context()
     const backend = new ControlledBackend()
@@ -1157,6 +1171,31 @@ describe('PersistenceCoordinator session preparations', () => {
       await coordinator.inspect(secondId)
       await coordinator.inspect(firstId)
       expect(backend.loadAttempts).toBe(3)
+    } finally {
+      await fiber.dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('does not retain a preparation above the logical event capacity', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    const backend = new ControlledBackend()
+    const id = SessionId('preparation-event-capacity')
+    backend.store.set(id, { meta: meta(id), events: oneTurnLog() })
+    let coordinator!: PersistenceCoordinator<never>
+    const fiber = await ctx.plugin(Object.assign((inner: Context) => {
+      coordinator = new PersistenceCoordinator(inner, backend, {
+        preparedSessionCacheSize: 5,
+        preparedSessionCacheMaxEvents: 1,
+        writeBatchMaxDelayMs: DEFAULT_WRITE_BATCH_MAX_DELAY_MS,
+      })
+    }, { inject: ['sessions'] }))
+
+    try {
+      await coordinator.inspect(id)
+      await coordinator.inspect(id)
+      expect(backend.loadAttempts).toBe(2)
     } finally {
       await fiber.dispose()
       await ctx.fiber.dispose()

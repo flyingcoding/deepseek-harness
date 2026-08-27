@@ -32,7 +32,10 @@ export interface SessionPreparationReservation<Source, CommitState> {
 export class SessionPreparations<Source extends PreparedSource, CommitState> {
   private readonly entries = new Map<SessionId, PreparationEntry<Source, CommitState>>()
 
-  constructor(private readonly capacity: number) {}
+  constructor(
+    private readonly capacity: number,
+    private readonly maxReadyEvents: number = Number.MAX_SAFE_INTEGER,
+  ) {}
 
   /**
    * Whether this pool currently knows about an unpublished identity.
@@ -286,14 +289,24 @@ export class SessionPreparations<Source extends PreparedSource, CommitState> {
     this.entries.delete(entry.id)
     this.entries.set(entry.id, entry)
     let readyCount = 0
+    let readyEvents = 0
     for (const candidate of this.entries.values()) {
-      if (candidate.phase === 'ready') readyCount += 1
+      if (candidate.phase !== 'ready' || candidate.source === undefined) continue
+      readyCount += 1
+      readyEvents += candidate.source.session.seq
     }
-    if (readyCount <= this.capacity) return
-    for (const [id, candidate] of this.entries) {
-      if (candidate.phase !== 'ready') continue
-      this.entries.delete(id)
-      return
+    while (readyCount > this.capacity || readyEvents > this.maxReadyEvents) {
+      let removed = false
+      for (const [id, candidate] of this.entries) {
+        if (candidate.phase !== 'ready' || candidate.source === undefined) continue
+        this.entries.delete(id)
+        readyCount -= 1
+        readyEvents -= candidate.source.session.seq
+        removed = true
+        break
+      }
+      /* v8 ignore next -- the counters include only ready entries found by the eviction loop. */
+      if (!removed) return
     }
   }
 }

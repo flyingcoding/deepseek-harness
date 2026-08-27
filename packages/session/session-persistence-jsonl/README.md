@@ -27,6 +27,7 @@ The JSONL durable session-persistence backend — a concrete `SessionPersistence
 | `packChunks` | `boolean` (default `true`) | Write eligible delta-chunk runs as packed rows (~60% smaller logical logs measured on a real coding session). Set `false` for one-event-per-line diagnostics; reading packed rows works regardless of this write-side switch. |
 | `compression` | `'zstd' \| 'none'` | Defaults to `'zstd'`; `'none'` retains newline-delimited UTF-8 text. |
 | `preparedSessionCacheSize` | positive integer (default `5`) | Maximum unpublished Sessions retained after cold history inspection for reuse by resume. |
+| `preparedSessionCacheMaxEvents` | positive integer (default `1,000,000`) | Maximum total logical events across retained unpublished Sessions. An inspection above the limit still succeeds but is not retained. |
 | `writeBatchMaxDelayMs` | positive integer (default `200`) | Fixed coalescing window after an idle live-event queue receives work. Later events do not reset it; flush and teardown bypass it. It does not bound event-loop, serialized-operation, or backend latency. At most Node's `2_147_483_647` ms timer limit. |
 
 `locate(meta)` returns `{ kind: 'jsonl', path }` for the fixed transcript inside the resolved project/session directories. It performs no filesystem I/O: the target can be returned before the directory or file exists, and an existing file contains only the last flushed prefix.
