@@ -19,6 +19,13 @@ interface PreparationEntry<Source, CommitState> {
   reservation?: SessionPreparationReservation<Source, CommitState>
   reservationSettled?: Promise<void>
   settleReservation?: () => void
+  pins: number
+}
+
+/** A borrowed prepared source that remains outside ready-entry eviction until released. */
+export interface PreparationLease<Source> extends Disposable {
+  /** Shared immutable prepared source. */
+  readonly source: Source
 }
 
 /** One exclusively held prepared source and its committed persistence state. */
@@ -65,6 +72,51 @@ export class SessionPreparations<Source extends PreparedSource, CommitState> {
     const source = entry.source ?? loaded
     if (this.entries.get(id) === entry && entry.phase === 'ready') this.touch(entry)
     return source
+  }
+
+  /**
+   * Borrow one prepared source and pin its ready entry against LRU eviction.
+   * @param id - session identity.
+   * @param load - cold loader used when no entry exists.
+   * @param signal - optional cancellation signal while waiting.
+   * @returns a caller-owned observation lease.
+   */
+  async borrow(
+    id: SessionId,
+    load: () => Promise<Source>,
+    signal?: AbortSignal,
+  ): Promise<PreparationLease<Source>> {
+    const entry = this.entryFor(id, load)
+    const pinned = this.entries.get(id) === entry
+    if (pinned) entry.pins += 1
+    let loaded: Source
+    try {
+      loaded = signal === undefined
+        ? await entry.result
+        : await observeQueuedAbort(entry.result, signal)
+    } catch (error: unknown) {
+      if (pinned && this.entries.get(id) === entry) {
+        entry.pins -= 1
+        if (entry.phase === 'ready') this.touch(entry)
+      }
+      throw error
+    }
+    const source = entry.source ?? loaded
+    if (this.entries.get(id) !== entry) {
+      return { source, [Symbol.dispose]: () => {} }
+    }
+    if (entry.phase === 'ready') this.touch(entry)
+    let released = false
+    return {
+      source,
+      [Symbol.dispose]: () => {
+        if (released) return
+        released = true
+        if (this.entries.get(id) !== entry) return
+        entry.pins -= 1
+        if (entry.phase === 'ready') this.touch(entry)
+      },
+    }
   }
 
   /**
@@ -241,6 +293,7 @@ export class SessionPreparations<Source extends PreparedSource, CommitState> {
       id,
       result: deferred.promise,
       phase: 'loading',
+      pins: 0,
     }
     this.entries.set(id, entry)
     let loading: Promise<Source>
@@ -298,14 +351,14 @@ export class SessionPreparations<Source extends PreparedSource, CommitState> {
     while (readyCount > this.capacity || readyEvents > this.maxReadyEvents) {
       let removed = false
       for (const [id, candidate] of this.entries) {
-        if (candidate.phase !== 'ready' || candidate.source === undefined) continue
+        if (candidate.phase !== 'ready' || candidate.source === undefined || candidate.pins > 0) continue
         this.entries.delete(id)
         readyCount -= 1
         readyEvents -= candidate.source.session.seq
         removed = true
         break
       }
-      /* v8 ignore next -- the counters include only ready entries found by the eviction loop. */
+      /* v8 ignore next -- only pinned ready entries can keep the counters above their limits. */
       if (!removed) return
     }
   }
