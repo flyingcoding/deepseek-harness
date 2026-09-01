@@ -31,6 +31,18 @@ export interface SessionInspection {
   readonly events: readonly SessionEvent[]
 }
 
+/** A bounded contiguous window from one stored Session log. */
+export interface SessionPersistenceWindow {
+  /** Detached metadata from the same stored artifact. */
+  readonly meta: SessionHeader
+  /** Bounded logical events ending before the requested sequence. */
+  readonly events: readonly SessionEvent[]
+  /** Last sequence in the complete stored prefix, or -1 when empty. */
+  readonly cursor: number
+  /** Whether stored events precede this window. */
+  readonly hasMore: boolean
+}
+
 /** A borrowed exact Session source returned from a cold materialization or concurrent live owner. */
 export type BorrowedSessionSource = Disposable & (
   | {
@@ -77,6 +89,7 @@ export type {
   PersistenceCoordinatorOptions,
   StoredPrefix,
   StoredSuffix,
+  StoredWindow,
 } from './coordinator.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -262,6 +275,41 @@ export abstract class SessionPersistence extends Service {
    */
   abstract readFrom(id: SessionId, fromSeq: number, signal?: AbortSignal):
   Promise<{ meta: SessionHeader; events: SessionEvent[] }>
+
+  /**
+   * Read a bounded event window without requiring callers to materialize the
+   * complete stored Session. Sequential backends should override this method
+   * with a streaming ring-buffer scan.
+   * @param id - persisted session to read.
+   * @param beforeSeq - exclusive upper sequence bound; omitted selects the tail.
+   * @param maxEvents - maximum logical events returned.
+   * @param signal - optional cancellation for backend work.
+   * @returns one bounded contiguous window and the complete stored cursor.
+   */
+  async readWindow(
+    id: SessionId,
+    beforeSeq: number | undefined,
+    maxEvents: number,
+    signal?: AbortSignal,
+  ): Promise<SessionPersistenceWindow> {
+    if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) {
+      throw new TypeError('beforeSeq must be a non-negative safe integer')
+    }
+    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1) {
+      throw new TypeError('maxEvents must be a positive safe integer')
+    }
+    const inspection = await this.inspect(id, signal)
+    signal?.throwIfAborted()
+    const cursor = inspection.events.at(-1)?.seq ?? -1
+    const end = Math.min(inspection.events.length, beforeSeq ?? inspection.events.length)
+    const start = Math.max(0, end - maxEvents)
+    return {
+      meta: inspection.meta,
+      events: inspection.events.slice(start, end),
+      cursor,
+      hasMore: start > 0,
+    }
+  }
 
   /**
    * Lightweight listing from metadata, without a full-log parse.

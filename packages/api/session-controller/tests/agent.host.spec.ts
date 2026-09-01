@@ -141,7 +141,6 @@ describe('ApiSession Agent lookup and recovery', () => {
       events: [],
       cursor: -1,
       projections: { asOfSeq: -1, values: {} },
-      retain: vi.fn(),
       [Symbol.dispose]: vi.fn(),
     } as unknown as SessionObservation
 
@@ -233,7 +232,6 @@ describe('ApiSession Agent lookup and recovery', () => {
       header: meta,
       events: [],
       cursor: -1,
-      retain: vi.fn(),
       [Symbol.dispose]: vi.fn(),
     } as unknown as SessionObservation
 

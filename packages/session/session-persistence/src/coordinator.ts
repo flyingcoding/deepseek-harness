@@ -17,7 +17,12 @@ import {
 import type { Session, SessionEvent, SessionId, SessionHeader } from '@deepseek-ai/dsh-session'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
-import type { BorrowedSessionSource, SessionInspection, SessionLocation } from './index.ts'
+import type {
+  BorrowedSessionSource,
+  SessionInspection,
+  SessionLocation,
+  SessionPersistenceWindow,
+} from './index.ts'
 import { SessionPersistenceNotFoundError } from './errors.ts'
 import type { SessionPersistenceRevision } from './revision.ts'
 import { observeQueuedAbort, SessionPreparations } from './preparations.ts'
@@ -28,7 +33,7 @@ import { SessionWriteBehind } from './write-behind.ts'
 export const DEFAULT_PREPARED_SESSION_CACHE_SIZE = 5
 
 /** Default total logical events retained across detached session preparations. */
-export const DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS = 1_000_000
+export const DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS = 20_000
 
 /** Default maximum intentional wait before a live session batch starts writing. */
 export const DEFAULT_WRITE_BATCH_MAX_DELAY_MS = 200
@@ -120,6 +125,14 @@ export interface StoredSuffix {
   events: SessionEvent[]
 }
 
+/** Backend-produced bounded window whose scan still observes the complete cursor. */
+export interface StoredWindow {
+  meta: SessionHeader
+  events: SessionEvent[]
+  cursor: number
+  hasMore: boolean
+}
+
 /**
  * The storage contract between {@link PersistenceCoordinator} and a concrete
  * backend: the minimal set of durable primitives the orchestration calls. A
@@ -180,6 +193,18 @@ export interface PersistenceBackend<TornMarker = unknown> {
    * @param signal - optional cancellation for backend read work.
    */
   loadStoredFrom?(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<StoredSuffix | undefined>
+
+  /**
+   * Optional streaming window read behind the service's `readWindow` method.
+   * Sequential backends implement this with bounded retention while scanning
+   * the complete physical prefix for sequence continuity.
+   */
+  loadStoredWindow?(
+    id: SessionId,
+    beforeSeq: number | undefined,
+    maxEvents: number,
+    signal?: AbortSignal,
+  ): Promise<StoredWindow | undefined>
 
   /** Durably create an empty header-only session artifact. */
   materializeHeader?(meta: SessionHeader): Promise<void>
@@ -933,6 +958,72 @@ export class PersistenceCoordinator<TornMarker = unknown> {
     const retired = Promise.resolve(this.retirements.get(id))
     const waited = signal === undefined ? retired : observeQueuedAbort(retired, signal, () => false)
     return waited.then(() => this.serialize(id, () => this.readFromCore(id, fromSeq, signal), signal))
+  }
+
+  /**
+   * Read one bounded stored window without publishing or caching a Session.
+   * @param id - persisted session identity.
+   * @param beforeSeq - exclusive upper sequence bound; omitted selects the tail.
+   * @param maxEvents - maximum logical events returned.
+   * @param signal - optional cancellation for backend work.
+   * @returns bounded events plus the complete stored cursor.
+   */
+  readWindow(
+    id: SessionId,
+    beforeSeq: number | undefined,
+    maxEvents: number,
+    signal?: AbortSignal,
+  ): Promise<SessionPersistenceWindow> {
+    if (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0)) {
+      return Promise.reject(new TypeError('beforeSeq must be a non-negative safe integer'))
+    }
+    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1) {
+      return Promise.reject(new TypeError('maxEvents must be a positive safe integer'))
+    }
+    const retired = Promise.resolve(this.retirements.get(id))
+    const waited = signal === undefined ? retired : observeQueuedAbort(retired, signal, () => false)
+    return waited.then(() => this.serialize(id, async () => {
+      signal?.throwIfAborted()
+      const stored = this.backend.loadStoredWindow === undefined
+        ? undefined
+        : await this.backend.loadStoredWindow(id, beforeSeq, maxEvents, signal)
+      if (stored === undefined) {
+        const whole = await this.readStoredPrefix(id, signal)
+        const cursor = whole.events.at(-1)?.seq ?? -1
+        const end = Math.min(whole.events.length, beforeSeq ?? whole.events.length)
+        const start = Math.max(0, end - maxEvents)
+        return { meta: whole.meta, events: whole.events.slice(start, end), cursor, hasMore: start > 0 }
+      }
+      this.assertStoredId(id, stored.meta)
+      this.assertVersion(stored.meta)
+      if (stored.events.some(needsLegacyPrefix)) {
+        const whole = await this.readStoredPrefix(id, signal)
+        const end = Math.min(whole.events.length, beforeSeq ?? whole.events.length)
+        const start = Math.max(0, end - maxEvents)
+        return {
+          meta: whole.meta,
+          events: whole.events.slice(start, end),
+          cursor: whole.events.at(-1)?.seq ?? -1,
+          hasMore: start > 0,
+        }
+      }
+      const events = snapshotStoredEvents(stored.events, id)
+      this.assertEventsSupported(stored.meta, events)
+      const expectedLast = Math.min(stored.cursor, (beforeSeq ?? stored.cursor + 1) - 1)
+      if (events.length > 0) {
+        const first = events[0] as SessionEvent
+        const last = events.at(-1) as SessionEvent
+        if (last.seq !== expectedLast || first.seq !== last.seq - events.length + 1) {
+          throw new Error(`session "${id}" backend returned a non-contiguous stored window`)
+        }
+      }
+      return {
+        meta: structuredClone(stored.meta),
+        events,
+        cursor: stored.cursor,
+        hasMore: stored.hasMore,
+      }
+    }, signal))
   }
 
   private async readFromCore(

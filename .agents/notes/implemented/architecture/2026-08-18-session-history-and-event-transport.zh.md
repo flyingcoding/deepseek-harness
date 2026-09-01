@@ -153,8 +153,8 @@ Session Remote 方法传递 `SessionId` 或 `SessionAddress`，不靠参数类�
 | 操作 | 无 live Agent 时的数据来源或结果 | 激活规则 |
 |---|---|---|
 | `session.list`、`search` | header 与投影缓存；可通过有界的小日志读取判断不确定的 blank 状态 | 永不恢复 Agent |
-| `session.page(address)` | attached Session 或 persistence 日志 | 永不恢复 Agent |
-| `session.follow(address)` | 一份携带 opening page 与 projection 的 live 或 prepared observation | 先发布 snapshot，再在后台把普通冷 Session 提升一次 |
+| `session.page(address)` | attached Session 或有界 persistence window | 永不恢复 Agent |
+| `session.follow(address)` | live observation，或有界 cold persistence window 加 cached projection | 永不恢复 Agent |
 | `session.control()` | 当前 attached Agent、pending registry 与进程内 registry | baseline 与重连不恢复 Agent |
 | `session.attachment`、fork 源读取 | 已授权的持久 Session 数据 | 读取不恢复 Agent |
 | `session.updateQueue`、`cancel` | 仅命中当前 live Agent | 不为已消失状态恢复 Agent |
@@ -171,17 +171,17 @@ Session Remote 方法传递 `SessionId` 或 `SessionAddress`，不靠参数类�
 
 #### Session 日志
 
-`session.page` 返回一段按消息边界裁剪、内部 seq 连续的历史窗口。每个请求必须显式携带 `throughSeq`；该值来自对应 `session.follow` generation 的 opening cursor，并把本次读取固定在同一个日志切点。无 `beforeSeq` 的 tail page 必须精确结束于 `throughSeq`，其中 `-1` 表示空日志；`beforeSeq` 只选择该切点之前的更早页面，不能替代同步 cursor。`maxMessages` 限制 user／assistant 消息数，不丢弃这些消息之间的 chunk、tool 或状态事件。
+`session.page` 返回一段内部 seq 连续的历史窗口。每个请求必须显式携带 `throughSeq`；该值来自对应 `session.follow` generation 的 opening cursor，并把本次读取固定在同一个日志切点。无 `beforeSeq` 的 tail page 必须精确结束于 `throughSeq`，其中 `-1` 表示空日志；`beforeSeq` 只选择该切点之前的更早页面，不能替代同步 cursor。当消息边界位于 `historyPageMaxEvents` 内时，`maxMessages` 按消息对齐裁剪；异常大的单条消息可以在逻辑事件上限处分割，向后分页会恢复其此前连续前缀。
 
 tail page 同时携带不晚于 `throughSeq` 的 projection baseline；旧页只携带历史 entries。Client 以 projection watermark 合并 page 与后续 live control 更新。
 
 普通 Session 与 direct subagent 使用同一个 `SessionAddress` 协议。direct subagent 地址同时携带父 Session、子 Session 与 mode，Host 冷读时验证持久 ownership 和 descriptor，不能只凭 child id 越权读取。
 
-`session.follow` 在观察 attached 或 prepared Session 前先安装 `session/event` 与 `session/created` listener。
+`session.follow` 在观察 attached Session 或扫描 cold window 前先安装 `session/event` 与 `session/created` listener。
 
 首次 follow 返回完整的 `{ type: 'snapshot', header, cursor, events, hasMore, projections }` frame。每次重连都发送另一份完整 snapshot replacement；协议不含 `afterSeq`。观察期间提交的 event 会保留在缓冲区，并在 snapshot 之后按 seq 发出。
 
-普通冷 Session 可以立即发布 prepared snapshot。首帧之后，Controller 把 retained observation 交给一次后台 promotion；follow 不等待激活。Direct-subagent 地址不会进入该 promotion 路径。
+普通冷 Session 通过 `SessionPersistence.readWindow()` 读取 opening records。JSONL／Zstandard 会检查每条物理记录的 seq 连续性，但只保留配置的逻辑事件 window，因此打开数百万事件日志不会构造完整 `Session.events` 数组。Cold baseline 来自 cached projection row；缓存缺失时使用 seq `-1` 的空 baseline。扫描既不发布也不 promote Agent。后续显式 Agent 操作独立恢复，`session/created` 会把其 suffix 衔接到既有 follower。
 
 Client 的 `SessionEventStream` 继承 `RemoteJournalStream`，只提供 `session.follow`、`session.page`、Session seq 算法与 repair request。通用层直接校验并发布 opening snapshot；仅在读取更早历史或后续 event 暴露 seq gap 时调用 `session.page({ throughSeq })`。
 
@@ -342,7 +342,7 @@ Connection 测试固定 generation source 缺失、重复注册、撤回、ready
 
 `RemoteJournalStream` 测试固定 snapshot-first opening、连续 append、历史 prepend、重连 replacement、gap repair 与一次性 replacement。
 
-Session Host 测试固定 cold page／follow 不增加 attached Agent、显式 prompt 后 cold follow 收到连续事件、direct subagent ownership、message-aligned pagination 和终止错误投影。
+Session Host 测试固定有界 cold page／follow 不执行完整 observation、也不增加 attached Agent，显式 prompt 后 cold follow 收到连续事件、direct subagent ownership、event-capped pagination 和终止错误投影。Persistence contract 测试固定 tail 与 earlier window 都携带完整 stored cursor；JSONL 与 Zstandard 通过流式有界保留执行该 contract。
 
 Session control 测试固定 baseline-first、冷 Session 不恢复、attach／detach 清理、queue 与 jobs replacement，以及 projection watermark。
 

@@ -212,12 +212,14 @@ export interface Config {
 export interface Config {
   /** Maximum cold Session artifact size eligible for one full projection observation. */
   readonly coldBlankProbeMaxBytes?: number
+  /** Maximum logical events returned by one history page or follow opening. */
+  readonly historyPageMaxEvents?: number
   /** Override platform desktop-opener detection. */
   readonly nativeOpen?: boolean
 }
 ```
 
-来源：[`packages/api/session-controller/src/index.ts:67`](../packages/api/session-controller/src/index.ts)
+来源：[`packages/api/session-controller/src/index.ts:66`](../packages/api/session-controller/src/index.ts)
 
 <a id="deepseek-aidsh-api-settings-controller"></a>
 

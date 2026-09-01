@@ -105,7 +105,7 @@ describe('Session history raw journal', () => {
   it('follows raw tool events and preserves result metadata without a Tools service', async () => {
     const { ctx } = await harness()
     const session = ctx.sessions.create(undefined, { meta: { cwd: '/workspace' } })
-    const history = new SessionHistoryController(ctx, (observation) => { observation[Symbol.dispose]() })
+    const history = new SessionHistoryController(ctx)
     const abort = new AbortController()
     const stream = await openFollow(history, session.id, abort.signal)
     const collected = collect(stream, 2, abort)
@@ -134,7 +134,7 @@ describe('Session history raw journal', () => {
   it('follows live results without rescanning Session history', async () => {
     const { ctx } = await harness()
     const session = ctx.sessions.create(undefined, { meta: { cwd: '/workspace' } })
-    const history = new SessionHistoryController(ctx, (observation) => { observation[Symbol.dispose]() })
+    const history = new SessionHistoryController(ctx)
     const abort = new AbortController()
     const stream = await openFollow(history, session.id, abort.signal)
     const iterator = stream[Symbol.asyncIterator]()
@@ -349,7 +349,7 @@ describe('Session history raw journal', () => {
   it('follows a result after turn/end without reading the addressed Session log', async () => {
     const { ctx } = await harness()
     const session = ctx.sessions.create(undefined, { meta: { cwd: '/workspace' } })
-    const history = new SessionHistoryController(ctx, (observation) => { observation[Symbol.dispose]() })
+    const history = new SessionHistoryController(ctx)
     const abort = new AbortController()
     const stream = await openFollow(history, session.id, abort.signal)
     const iterator = stream[Symbol.asyncIterator]()

@@ -153,8 +153,8 @@ Each method explicitly selects a cold inspection, live-only lookup, or resume-ca
 | Operation | Source or result without a live Agent | Activation rule |
 |---|---|---|
 | `session.list`, `search` | headers and projection cache; a bounded small-log read can resolve uncertain blankness | Never resumes an Agent |
-| `session.page(address)` | attached Session or persistence log | Never resumes an Agent |
-| `session.follow(address)` | one live or prepared observation carrying the opening page and projections | Publishes the snapshot first, then promotes an ordinary cold Session once in the background |
+| `session.page(address)` | attached Session or a bounded persistence window | Never resumes an Agent |
+| `session.follow(address)` | live observation or bounded cold persistence window plus cached projections | Never resumes an Agent |
 | `session.control()` | current attached Agents, pending registry, and process-local registries | Baseline and reconnect do not resume an Agent |
 | `session.attachment`, fork source read | authorized durable Session data | A read does not resume an Agent |
 | `session.updateQueue`, `cancel` | only the current live Agent | Does not resume vanished state |
@@ -171,17 +171,17 @@ Reading titles, lists, and projections does not require an Agent. An observation
 
 #### Session journal
 
-`session.page` returns a history window clipped on message boundaries with contiguous internal sequence numbers. Every request must carry an explicit `throughSeq`; this value comes from the corresponding `session.follow` generation's opening cursor and fixes the read at the same log cut. A tail page without `beforeSeq` must end exactly at `throughSeq`, where `-1` denotes an empty log. `beforeSeq` only selects an older page before that cut and cannot replace the synchronization cursor. `maxMessages` limits user/assistant message count without dropping chunks, tools, or state events between those messages.
+`session.page` returns a history window with contiguous internal sequence numbers. Every request must carry an explicit `throughSeq`; this value comes from the corresponding `session.follow` generation's opening cursor and fixes the read at the same log cut. A tail page without `beforeSeq` must end exactly at `throughSeq`, where `-1` denotes an empty log. `beforeSeq` only selects an older page before that cut and cannot replace the synchronization cursor. `maxMessages` applies a message-aligned cut when it fits inside `historyPageMaxEvents`; an unusually large message may be split at the logical-event limit, and backwards paging restores its preceding contiguous prefix.
 
 The tail page also carries a projection baseline no later than `throughSeq`; older pages carry only historical entries. The Client merges pages and subsequent live control updates by projection watermark.
 
 Ordinary Sessions and direct subagents use one `SessionAddress` protocol. A direct-subagent address carries parent Session, child Session, and mode; a cold Host read verifies durable ownership and descriptor rather than authorizing access from the child id alone.
 
-`session.follow` installs `session/event` and `session/created` listeners before observing an attached or prepared Session.
+`session.follow` installs `session/event` and `session/created` listeners before observing an attached Session or scanning a cold window.
 
 The first follow response is a complete `{ type: 'snapshot', header, cursor, events, hasMore, projections }` frame. Every reconnect sends another complete snapshot replacement; the protocol has no `afterSeq`. Events committed during observation remain buffered and are emitted after the snapshot in sequence order.
 
-A cold ordinary Session can publish its prepared snapshot immediately. After that first frame, the Controller transfers a retained observation to one background promotion; follow does not wait for activation. Direct-subagent addresses never use this promotion path.
+A cold ordinary Session reads its opening records through `SessionPersistence.readWindow()`. JSONL/Zstandard scans every physical row for sequence continuity but retains only the configured logical-event window, so opening a multi-million-event log does not construct a complete `Session.events` array. Cached projection rows supply the cold baseline; absence is represented by an empty baseline at sequence `-1`. The scan neither publishes nor promotes an Agent. A later explicit Agent operation resumes independently, and `session/created` bridges its suffix into the existing follower.
 
 Client `SessionEventStream` extends `RemoteJournalStream` and supplies only `session.follow`, `session.page`, the Session sequence algorithm, and repair requests. The general layer validates and publishes the opening snapshot directly. It calls `session.page({ throughSeq })` only for older history or when a later event reveals a sequence gap.
 
@@ -342,7 +342,7 @@ Connection tests pin missing, duplicate, and withdrawn generation sources, readi
 
 `RemoteJournalStream` tests pin snapshot-first opening, contiguous append, historical prepend, reconnect replacement, gap repair, and one atomic replacement.
 
-Session Host tests pin cold page/follow without increasing attached Agents, contiguous events reaching a cold follow after an explicit prompt, direct-subagent ownership, message-aligned pagination, and terminal-error projection.
+Session Host tests pin bounded cold page/follow without full observation or attached Agents, contiguous events reaching a cold follow after an explicit prompt, direct-subagent ownership, event-capped pagination, and terminal-error projection. Persistence contract tests pin tail and earlier windows with the complete stored cursor; JSONL and Zstandard run that contract through streaming bounded retention.
 
 Session control tests pin baseline-first delivery, no cold-Session resume, attach/detach cleanup, queue and jobs replacement, and the projection watermark.
 

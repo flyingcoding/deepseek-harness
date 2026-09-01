@@ -91,7 +91,7 @@ const headers = await ctx.sessionPersistence.list()        // every stored sessi
 
 ### 存储记录兼容
 
-后端读取只会在校验当前记录之前，规范化明确支持的 v0 记录变体。协调器对 `load`、`inspect`、`readFrom`、无所有者状态认领与 HMR 接管使用同一份规范化视图。读取不会重写已存记录，后续追加使用当前 v0。[消息标识机制引入前的消息](../../../.agents/notes/implemented/bug-fix/2026-07-28-load-pre-identity-session-messages.zh.md)与 [react-loop 引入前会话](../../../.agents/notes/implemented/bug-fix/2026-08-04-load-pre-react-loop-sessions.zh.md)笔记规定这些有限例外；它们不构成通用格式迁移承诺。
+后端读取只会在校验当前记录之前，规范化明确支持的 v0 记录变体。协调器对 `load`、`inspect`、`readFrom`、`readWindow`、无所有者状态认领与 HMR 接管使用同一份规范化视图。后端 window hook 可以在不保留更早 record 的前提下校验前缀连续性；如果返回 suffix 含有需要此前消息 identity 的 legacy event，协调器会回退到完整规范化前缀。读取不会重写已存记录，后续追加使用当前 v0。[消息标识机制引入前的消息](../../../.agents/notes/implemented/bug-fix/2026-07-28-load-pre-identity-session-messages.zh.md)与 [react-loop 引入前会话](../../../.agents/notes/implemented/bug-fix/2026-08-04-load-pre-react-loop-sessions.zh.md)笔记规定这些有限例外；它们不构成通用格式迁移承诺。
 
 </details>
 -----

@@ -104,7 +104,7 @@ describe('SessionObservationReader', () => {
     await ctx.fiber.dispose()
   })
 
-  it('reference-counts prepared leases and rejects retention after disposal', async () => {
+  it('releases a prepared observation exactly once', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
     const meta = header('prepared-leases')
@@ -113,29 +113,21 @@ describe('SessionObservationReader', () => {
       borrowSession: () => Promise.resolve(preparedSource(meta, dispose)),
     } as never)
     const observed = await new SessionObservationReader(ctx).read(meta.id, { projectionMode: 'none' })
-    const retained = observed.retain()
-
     observed[Symbol.dispose]()
     observed[Symbol.dispose]()
-    expect(dispose).not.toHaveBeenCalled()
-    expect(() => observed.retain()).toThrow('is disposed')
-    retained[Symbol.dispose]()
     expect(dispose).toHaveBeenCalledOnce()
     await ctx.fiber.dispose()
   })
 
-  it('creates independent live leases and rejects retention after disposal', async () => {
+  it('allows idempotent disposal of a live observation', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
     const session = ctx.sessions.create(SessionId('live-leases'), { meta: { cwd: '/workspace' } })
     const reader = new SessionObservationReader(ctx)
     const observed = await reader.read(session.id, { projectionMode: 'none' })
-    const retained = observed.retain()
-
     observed[Symbol.dispose]()
-    expect(() => observed.retain()).toThrow('is disposed')
-    expect(retained.source).toBe('live')
-    retained[Symbol.dispose]()
+    observed[Symbol.dispose]()
+    expect(observed.source).toBe('live')
     await ctx.fiber.dispose()
   })
 

@@ -48,7 +48,7 @@ Choose this backend when consumers benefit from one artifact per session — nav
 | `packChunks` | `true` | Write eligible `assistant/chunk` runs as packed rows; `false` keeps one event per line for diagnostics |
 | `compression` | `'zstd'` | Physical encoding: `'zstd'` checksummed frames, or `'none'` newline-delimited UTF-8 text |
 | `preparedSessionCacheSize` | `5` | Cold session preparations retained for resume reuse |
-| `preparedSessionCacheMaxEvents` | `1,000,000` | Maximum total logical events across retained cold preparations; an oversized inspection succeeds without staying cached |
+| `preparedSessionCacheMaxEvents` | `20,000` | Maximum total logical events across retained cold preparations; an oversized inspection succeeds without staying cached |
 | `writeBatchMaxDelayMs` | `200` | Fixed live-event coalescing window, in milliseconds |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-session-persistence-jsonl) is the exhaustive source for every accepted field and its JSDoc.
@@ -73,7 +73,7 @@ A session is materialized lazily: `create(meta)` writes nothing, and the first `
 
 ### Reading the logs
 
-`inspect(id)` returns an immutable balanced view without committing recovery. `readFrom(id, fromSeq)` returns stored events at or past a sequence number for watermark consumers; sequential media like JSONL parse the whole artifact and skip forward. With `compression: 'none'`, the log is newline-delimited text an external reader can consume directly; the compressed default must be read through the backend.
+`inspect(id)` returns an immutable balanced view without committing recovery. `readFrom(id, fromSeq)` returns stored events at or past a sequence number for watermark consumers; sequential media like JSONL parse the whole artifact and skip forward. `readWindow(id, beforeSeq, maxEvents)` also scans the complete physical prefix, but validates sequence continuity while retaining only a bounded logical-event ring; cold history therefore does not construct the complete expanded Session. With `compression: 'none'`, the log is newline-delimited text an external reader can consume directly; the compressed default must be read through the backend.
 
 -----
 

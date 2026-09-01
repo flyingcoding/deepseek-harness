@@ -99,6 +99,33 @@ export function runPersistenceContract(name: string, make: () => Promise<Contrac
       }
     })
 
+    it('reads bounded tail and earlier windows with the complete stored cursor', async () => {
+      const { persistence, dispose } = await make()
+      try {
+        const m = meta('bounded-window', '/work')
+        await persistence.create(m)
+        await persistence.append(m.id, [
+          ...oneTurnLog(),
+          { type: 'turn/start', seq: 6, time: 7, data: { turn: 2 } },
+          { type: 'turn/end', seq: 7, time: 8, data: { turn: 2, reason: { kind: 'completed' } } },
+        ])
+
+        await expect(persistence.readWindow(m.id, undefined, 3)).resolves.toMatchObject({
+          meta: { id: m.id },
+          events: [{ seq: 5 }, { seq: 6 }, { seq: 7 }],
+          cursor: 7,
+          hasMore: true,
+        })
+        await expect(persistence.readWindow(m.id, 6, 2)).resolves.toMatchObject({
+          events: [{ seq: 4 }, { seq: 5 }],
+          cursor: 7,
+          hasMore: true,
+        })
+      } finally {
+        await dispose()
+      }
+    })
+
     it('rejects a fractional creation timestamp without reserving its session id', async () => {
       const { persistence, dispose } = await make()
       try {

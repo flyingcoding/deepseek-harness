@@ -20,13 +20,13 @@ import {
   SessionPersistence, SessionPersistenceRevision, PersistenceCoordinator, SessionFormatUnsupportedError,
   type BorrowedSessionSource,
   type PersistenceBackend, type SessionLocation, type SessionPersistenceSnapshot,
-  type SessionInspection,
+  type SessionInspection, type SessionPersistenceWindow,
   type SessionPersistenceRevision as PersistenceRevision, type SessionRawArtifact,
-  type StoredPrefix,
+  type StoredPrefix, type StoredWindow,
 } from '@deepseek-ai/dsh-session-persistence'
 import type { Session, SessionEvent, SessionId, SessionHeader, SessionPreparation } from '@deepseek-ai/dsh-session'
 import {
-  encodeSegment, eventLines, logPath, logSuffix, parseHeaderMeta, projectDir, scanLog, sessionDir,
+  encodeSegment, eventLines, logPath, logSuffix, parseHeaderMeta, projectDir, scanLog, scanLogWindow, sessionDir,
   SessionLogScanner, toHeaderLine,
   type JsonlCompression,
 } from './format.ts'
@@ -217,6 +217,15 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     return this.coordinator.readFrom(id, fromSeq, signal)
   }
 
+  override readWindow(
+    id: SessionId,
+    beforeSeq: number | undefined,
+    maxEvents: number,
+    signal?: AbortSignal,
+  ): Promise<SessionPersistenceWindow> {
+    return this.coordinator.readWindow(id, beforeSeq, maxEvents, signal)
+  }
+
   // One method serves both public `list` and the backend hook; delegating it to
   // the coordinator would call this hook recursively.
 
@@ -231,6 +240,31 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     const path = await this.findLog(id, signal)
     if (path === undefined) return undefined
     return this.readPrefix(path, id, signal)
+  }
+
+  /** Stream one artifact while retaining only the requested logical window. */
+  async loadStoredWindow(
+    id: SessionId,
+    beforeSeq: number | undefined,
+    maxEvents: number,
+    signal?: AbortSignal,
+  ): Promise<StoredWindow | undefined> {
+    signal?.throwIfAborted()
+    await this.ensureRootEncoding()
+    const path = await this.findLog(id, signal)
+    if (path === undefined) return undefined
+    const { buffer } = await this.readStableFile(path, signal)
+    const window = this.compression === 'zstd'
+      ? await this.readZstdWindow(buffer, beforeSeq, maxEvents, signal)
+      : scanLogWindow(buffer, beforeSeq, maxEvents)
+    signal?.throwIfAborted()
+    await this.assertStoredIdentity(path, window.meta, id, signal)
+    return {
+      meta: window.meta,
+      events: window.events,
+      cursor: window.cursor,
+      hasMore: window.hasMore,
+    }
   }
 
   /**
@@ -431,6 +465,63 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
       /* v8 ignore next -- decoder failure plus concurrent abort is timing-dependent */
       if (signal?.aborted) signal.throwIfAborted()
       throw error
+    } finally {
+      decoder.close()
+    }
+  }
+
+  /** Decode every complete frame while retaining only one logical event window. */
+  private async readZstdWindow(
+    buffer: Buffer,
+    beforeSeq: number | undefined,
+    maxEvents: number,
+    signal?: AbortSignal,
+  ): Promise<StoredWindow> {
+    signal?.throwIfAborted()
+    const { frames, tornStart } = scanZstdFrames(buffer)
+    if (frames.length === 0) throw new Error('empty or header-less Zstandard session log')
+    const decoder = createZstdFrameDecoder()
+    let yieldDeadline = performance.now() + ZSTD_DECODE_YIELD_INTERVAL_MS
+    try {
+      const decodedFrames = decoder.decode(buffer, frames)
+      const headerFrame = decodedFrames.next()
+      /* v8 ignore next -- a non-empty structural frame list yields a header or throws. */
+      if (headerFrame.done) throw new Error('empty or header-less Zstandard session log')
+      assertZstdHeaderFrame(headerFrame.value)
+      const scanner = new SessionLogScanner(
+        headerFrame.value,
+        { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents },
+      )
+      let remainingFrames = frames.length - 1
+      for (const plaintext of decodedFrames) {
+        signal?.throwIfAborted()
+        scanner.write(plaintext)
+        remainingFrames -= 1
+        if (remainingFrames > 0 && performance.now() >= yieldDeadline) {
+          await scheduler.yield()
+          yieldDeadline = performance.now() + ZSTD_DECODE_YIELD_INTERVAL_MS
+        }
+      }
+      const complete = scanner.checkpoint()
+      if (complete.committedBytes !== complete.inputBytes) {
+        throw new Error('corrupt Zstandard session log: complete frame contains a torn JSONL record')
+      }
+      if (tornStart !== undefined) {
+        let recoveredPlaintext: Buffer = Buffer.alloc(0)
+        try {
+          recoveredPlaintext = await decompressZstdPrefix(buffer.subarray(tornStart))
+        } catch {
+          if (signal?.aborted) signal.throwIfAborted()
+        }
+        scanner.write(recoveredPlaintext)
+      }
+      const result = scanner.finishWindow()
+      return {
+        meta: result.meta,
+        events: result.events,
+        cursor: result.cursor,
+        hasMore: result.hasMore,
+      }
     } finally {
       decoder.close()
     }

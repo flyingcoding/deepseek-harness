@@ -391,7 +391,6 @@ describe('SubagentRuntime.listChildren', () => {
         events: [],
         cursor: -1,
         projections: { asOfSeq: -1, values: {} },
-        retain: vi.fn(),
         [Symbol.dispose]: dispose,
       } as unknown as SessionObservation)
     })

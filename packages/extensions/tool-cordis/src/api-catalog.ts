@@ -1527,6 +1527,12 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         returns: 'the header and the stored events with `seq >= fromSeq`.',
       },
       {
+        signature: 'async readWindow( id: SessionId, beforeSeq: number | undefined, maxEvents: number, signal?: AbortSignal, ): Promise<SessionPersistenceWindow>',
+        description: 'Read a bounded event window without requiring callers to materialize the complete stored Session. Sequential backends should override this method with a streaming ring-buffer scan.',
+        parameters: [{ name: 'id', description: 'persisted session to read.' }, { name: 'beforeSeq', description: 'exclusive upper sequence bound; omitted selects the tail.' }, { name: 'maxEvents', description: 'maximum logical events returned.' }, { name: 'signal', description: 'optional cancellation for backend work.' }],
+        returns: 'one bounded contiguous window and the complete stored cursor.',
+      },
+      {
         signature: 'abstract list(signal?: AbortSignal): Promise<SessionHeader[]>',
         description: 'Lightweight listing from metadata, without a full-log parse.',
         parameters: [{ name: 'signal', description: 'optional cancellation for backend listing work.' }],
@@ -4985,7 +4991,7 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   },
   {
     name: 'SessionObservation',
-    declaration: 'export interface SessionObservation extends Disposable {\n    readonly source: \'live\' | \'prepared\';\n    readonly header: SessionHeader;\n    readonly events: readonly SessionEvent[];\n    readonly cursor: number;\n    readonly revision?: SessionPersistenceRevision;\n    readonly projections?: ProjectionSnapshot;\n    retain(): SessionObservation;\n}',
+    declaration: 'export interface SessionObservation extends Disposable {\n    readonly source: \'live\' | \'prepared\';\n    readonly header: SessionHeader;\n    readonly events: readonly SessionEvent[];\n    readonly cursor: number;\n    readonly revision?: SessionPersistenceRevision;\n    readonly projections?: ProjectionSnapshot;\n}',
   },
   {
     name: 'SessionObservationOptions',
@@ -5014,6 +5020,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionPersistenceSnapshot',
     declaration: 'export interface SessionPersistenceSnapshot {\n    header: SessionHeader;\n    revision: SessionPersistenceRevision;\n}',
+  },
+  {
+    name: 'SessionPersistenceWindow',
+    declaration: 'export interface SessionPersistenceWindow {\n    readonly meta: SessionHeader;\n    readonly events: readonly SessionEvent[];\n    readonly cursor: number;\n    readonly hasMore: boolean;\n}',
   },
   {
     name: 'SessionPreparation',

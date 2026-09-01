@@ -61,7 +61,7 @@ async function setup(): Promise<{ ctx: Context; transport: SessionHistoryControl
   await ctx.plugin(SessionStore)
   installSessionReadTestServices(ctx)
   ctx.sessionProjections.register(subagentIdentityProjectionDefinition)
-  const transport = new SessionHistoryController(ctx, (observation) => { observation[Symbol.dispose]() })
+  const transport = new SessionHistoryController(ctx)
   return { ctx, transport }
 }
 
@@ -100,7 +100,7 @@ describe('SessionHistoryController', () => {
     let transport!: SessionHistoryController
     const owner = ctx.plugin(Object.assign(
       (inner: Context) => {
-        transport = new SessionHistoryController(inner, (observation) => { observation[Symbol.dispose]() })
+        transport = new SessionHistoryController(inner)
       },
       { inject: ['sessions', 'sessionQuery'] },
     ))
@@ -185,7 +185,7 @@ describe('SessionHistoryController', () => {
     const header = { version: 0, id: sessionId, createdAt: 1, cwd: '/workspace' }
     const observed = deferred<SessionObservation>()
     ctx.provide('sessionQuery', { observeSession: () => observed.promise } as never)
-    const transport = new SessionHistoryController(ctx, vi.fn())
+    const transport = new SessionHistoryController(ctx)
     const abort = new AbortController()
     const iterator = transport.follow({ address: { kind: 'session', sessionId } }, abort.signal)
       [Symbol.asyncIterator]()
@@ -198,7 +198,6 @@ describe('SessionHistoryController', () => {
       events: attached.events,
       cursor: attached.seq - 1,
       projections: { asOfSeq: attached.seq - 1, values: {} },
-      retain: vi.fn(),
       [Symbol.dispose]: vi.fn(),
     } as unknown as SessionObservation)
     await expect(opening).resolves.toMatchObject({
@@ -225,7 +224,7 @@ describe('SessionHistoryController', () => {
     let agentCtx!: Context
     await ctx.plugin(Object.assign(
       (inner: Context) => {
-        transport = new SessionHistoryController(inner, (observation) => { observation[Symbol.dispose]() })
+        transport = new SessionHistoryController(inner)
       },
       { inject: ['sessions', 'sessionQuery'] },
     ))
@@ -315,6 +314,53 @@ describe('SessionHistoryController', () => {
     await expect(iterator.next()).resolves.toMatchObject({ done: true })
   })
 
+  it('caps page and follow openings by logical event count', async () => {
+    const { ctx } = await setup()
+    const history = new SessionHistoryController(ctx, 3)
+    const session = ctx.sessions.create(SessionId('event-capped-history'), { meta: { cwd: '/workspace' } })
+    for (let turn = 1; turn <= 3; turn += 1) {
+      session.append('turn/start', { turn })
+      session.append('turn/end', { turn, reason: { kind: 'completed' } })
+    }
+
+    await expect(history.page({
+      address: { kind: 'session', sessionId: session.id },
+      throughSeq: 5,
+    }, signal())).resolves.toMatchObject({
+      records: [
+        { event: { seq: 3 } },
+        { event: { seq: 4 } },
+        { event: { seq: 5 } },
+      ],
+      hasMore: true,
+    })
+
+    const abort = new AbortController()
+    const iterator = history.follow({
+      address: { kind: 'session', sessionId: session.id },
+    }, abort.signal)[Symbol.asyncIterator]()
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: {
+        type: 'snapshot',
+        records: [
+          { event: { seq: 3 } },
+          { event: { seq: 4 } },
+          { event: { seq: 5 } },
+        ],
+        hasMore: true,
+      },
+    })
+    abort.abort()
+    await expect(iterator.next()).resolves.toMatchObject({ done: true })
+    await ctx.fiber.dispose()
+  })
+
+  it('rejects a non-positive history event cap', async () => {
+    const ctx = new Context()
+    expect(() => new SessionHistoryController(ctx, 0)).toThrow(/maxPageEvents must be a positive safe integer/)
+    await ctx.fiber.dispose()
+  })
+
   it('publishes an empty projection baseline when the query has no registry', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
@@ -323,10 +369,10 @@ describe('SessionHistoryController', () => {
     ctx.provide('sessionQuery', {
       observeSession: () => Promise.resolve({
         source: 'live', header: meta, events: [], cursor: -1,
-        retain: vi.fn(), [Symbol.dispose]: vi.fn(),
+        [Symbol.dispose]: vi.fn(),
       } satisfies SessionObservation),
     } as never)
-    const history = new SessionHistoryController(ctx, vi.fn())
+    const history = new SessionHistoryController(ctx)
     const abort = new AbortController()
     const iterator = history.follow({ address: { kind: 'session', sessionId } }, abort.signal)
       [Symbol.asyncIterator]()
@@ -339,32 +385,66 @@ describe('SessionHistoryController', () => {
     await ctx.fiber.dispose()
   })
 
-  it('disposes a retained promotion when background activation rejects synchronously', async () => {
+  it('releases a prepared opening observation before waiting for live events', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
     const sessionId = SessionId('promotion-failure')
     const meta = { version: 0, id: sessionId, createdAt: 1, cwd: '/workspace' }
-    const disposePromotion = vi.fn()
-    const promotion = {
+    const disposeObservation = vi.fn()
+    const source = {
       source: 'prepared', header: meta, events: [], cursor: -1,
       projections: { asOfSeq: -1, values: {} },
-      retain: vi.fn(), [Symbol.dispose]: disposePromotion,
+      [Symbol.dispose]: disposeObservation,
     } as unknown as SessionObservation
-    const source = {
-      ...promotion,
-      retain: () => promotion,
-      [Symbol.dispose]: vi.fn(),
-    } as SessionObservation
     ctx.provide('sessionQuery', {
       observeSession: () => Promise.resolve(source),
     } as never)
-    const history = new SessionHistoryController(ctx, () => { throw new Error('activation failed') })
-    const iterator = history.follow({ address: { kind: 'session', sessionId } }, signal())
+    const history = new SessionHistoryController(ctx)
+    const abort = new AbortController()
+    const iterator = history.follow({ address: { kind: 'session', sessionId } }, abort.signal)
       [Symbol.asyncIterator]()
 
     await expect(iterator.next()).resolves.toMatchObject({ value: { type: 'snapshot' } })
-    await expect(iterator.next()).rejects.toThrow('activation failed')
-    expect(disposePromotion).toHaveBeenCalledOnce()
+    expect(disposeObservation).toHaveBeenCalledOnce()
+    const waiting = iterator.next()
+    abort.abort()
+    await expect(waiting).resolves.toMatchObject({ done: true })
+    await ctx.fiber.dispose()
+  })
+
+  it('opens cold ordinary history through the bounded persistence window', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    const sessionId = SessionId('bounded-cold-opening')
+    const meta = { version: 0, id: sessionId, createdAt: 1, cwd: '/workspace' }
+    const readWindow = vi.fn(() => Promise.resolve({
+      meta,
+      events: [
+        event('fixture/start', 3),
+        event('fixture/end', 4),
+        event('turn/end', 5, { turn: 1, reason: { kind: 'completed' } }),
+      ],
+      cursor: 5,
+      hasMore: true,
+    }))
+    const observeSession = vi.fn(() => Promise.reject(new Error('full observation must not run')))
+    ctx.provide('sessionPersistence', { readWindow } as never)
+    ctx.provide('sessionQuery', { observeSession } as never)
+    const history = new SessionHistoryController(ctx, 3)
+    const abort = new AbortController()
+    const iterator = history.follow({ address: { kind: 'session', sessionId } }, abort.signal)
+      [Symbol.asyncIterator]()
+
+    await expect(iterator.next()).resolves.toMatchObject({
+      value: {
+        type: 'snapshot', cursor: 5, hasMore: true,
+        records: [{ event: { seq: 3 } }, { event: { seq: 4 } }, { event: { seq: 5 } }],
+      },
+    })
+    expect(readWindow).toHaveBeenCalledWith(sessionId, undefined, 3, abort.signal)
+    expect(observeSession).not.toHaveBeenCalled()
+    abort.abort()
+    await expect(iterator.next()).resolves.toMatchObject({ done: true })
     await ctx.fiber.dispose()
   })
 
@@ -570,10 +650,10 @@ describe('SessionHistoryController', () => {
       observeSession: () => Promise.resolve({
         source: 'live', header: meta, events: [], cursor: -1,
         projections: { asOfSeq: -1, values: {} },
-        retain: vi.fn(), [Symbol.dispose]: vi.fn(),
+        [Symbol.dispose]: vi.fn(),
       } as unknown as SessionObservation),
     } as never)
-    const history = new SessionHistoryController(ctx, vi.fn())
+    const history = new SessionHistoryController(ctx)
 
     await expect(history.page({
       address: { kind: 'subagent', parentSessionId, childSessionId, mode: 'continuable' },

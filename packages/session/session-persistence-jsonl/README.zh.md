@@ -48,7 +48,7 @@ kind: "package-reference"
 | `packChunks` | `true` | 把符合条件的 `assistant/chunk` 连续段写为打包行；`false` 为诊断保留每事件一行 |
 | `compression` | `'zstd'` | 物理编码：`'zstd'` 带校验和帧，或 `'none'` 换行分隔 UTF-8 文本 |
 | `preparedSessionCacheSize` | `5` | 为恢复复用而保留的冷会话准备结果数量 |
-| `preparedSessionCacheMaxEvents` | `1,000,000` | 保留的冷准备结果所含逻辑事件总数上限；超限检查仍会成功，但不会留在缓存中 |
+| `preparedSessionCacheMaxEvents` | `20,000` | 保留的冷准备结果所含逻辑事件总数上限；超限检查仍会成功，但不会留在缓存中 |
 | `writeBatchMaxDelayMs` | `200` | 实时事件的固定聚合窗口，单位为毫秒 |
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-session-persistence-jsonl)是每个受支持字段及其 JSDoc 的穷尽式真源。
@@ -73,7 +73,7 @@ kind: "package-reference"
 
 ### 读取日志
 
-`inspect(id)` 返回不可变的平衡视图，不提交恢复。`readFrom(id, fromSeq)` 为水位消费方返回该序列号及之后的已存储事件；JSONL 这类顺序介质解析整个产物并向前跳过。选择 `compression: 'none'` 后，日志是外部读取方可直接消费的换行分隔文本；压缩默认值必须经后端读取。
+`inspect(id)` 返回不可变的平衡视图，不提交恢复。`readFrom(id, fromSeq)` 为水位消费方返回该序列号及之后的已存储事件；JSONL 这类顺序介质解析整个产物并向前跳过。`readWindow(id, beforeSeq, maxEvents)` 同样扫描完整物理前缀，但会在校验 seq 连续性的同时只保留有界逻辑事件 ring，因此 cold history 不会构造完整展开 Session。选择 `compression: 'none'` 后，日志是外部读取方可直接消费的换行分隔文本；压缩默认值必须经后端读取。
 
 -----
 

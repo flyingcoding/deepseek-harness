@@ -378,6 +378,18 @@ abstract borrowSession(id: SessionId, signal?: AbortSignal): Promise<BorrowedSes
 abstract readFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ meta: SessionHeader; events: SessionEvent[] }>
 
 /**
+ * Read a bounded event window without requiring callers to materialize the
+ * complete stored Session. Sequential backends should override this method
+ * with a streaming ring-buffer scan.
+ * @param id - persisted session to read.
+ * @param beforeSeq - exclusive upper sequence bound; omitted selects the tail.
+ * @param maxEvents - maximum logical events returned.
+ * @param signal - optional cancellation for backend work.
+ * @returns one bounded contiguous window and the complete stored cursor.
+ */
+async readWindow( id: SessionId, beforeSeq: number | undefined, maxEvents: number, signal?: AbortSignal, ): Promise<SessionPersistenceWindow>
+
+/**
  * Lightweight listing from metadata, without a full-log parse.
  * @param signal - optional cancellation for backend listing work.
  * @returns one header per materialized session.

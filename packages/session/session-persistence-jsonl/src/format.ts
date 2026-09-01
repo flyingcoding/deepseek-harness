@@ -262,6 +262,21 @@ interface SessionLogScan {
   committedBytes: number
 }
 
+/** Result of a streaming bounded-window scan over one complete stored prefix. */
+export interface SessionLogWindowScan {
+  readonly meta: SessionHeader
+  readonly events: SessionEvent[]
+  readonly cursor: number
+  readonly hasMore: boolean
+  readonly committedBytes: number
+}
+
+/** Retention policy for a bounded scanner; events at `beforeSeq` are excluded. */
+export interface SessionLogWindowOptions {
+  readonly beforeSeq?: number
+  readonly maxEvents: number
+}
+
 /** Parse one complete header record supplied independently from event rows. */
 /**
  * Refuse a header carrying a format version this build does not read BEFORE
@@ -310,6 +325,7 @@ export class SessionLogScanner {
   private inputBytes: number
   private committedBytes: number
   private eventLine = 0
+  private nextSeq = 0
   private issue: Error | undefined
   private finished = false
 
@@ -317,7 +333,10 @@ export class SessionLogScanner {
    * Create an event scanner from exactly one newline-terminated header record.
    * @param headerRecord - the complete first JSONL record, including its newline.
    */
-  constructor(headerRecord: Buffer) {
+  constructor(
+    headerRecord: Buffer,
+    private readonly window?: SessionLogWindowOptions,
+  ) {
     this.meta = parseHeaderRecord(headerRecord)
     this.inputBytes = headerRecord.length
     this.committedBytes = headerRecord.length
@@ -363,7 +382,7 @@ export class SessionLogScanner {
     return {
       inputBytes: this.inputBytes,
       committedBytes: this.committedBytes,
-      eventCount: this.events.length,
+      eventCount: this.nextSeq,
     }
   }
 
@@ -374,6 +393,22 @@ export class SessionLogScanner {
   finish(): SessionLogScan {
     this.finished = true
     return { meta: this.meta, events: this.events, committedBytes: this.committedBytes }
+  }
+
+  /**
+   * Finish a bounded scan after every complete physical row has been checked.
+   * @returns the retained logical window and the complete stored cursor.
+   */
+  finishWindow(): SessionLogWindowScan {
+    if (this.window === undefined) throw new Error('scanner has no bounded-window policy')
+    this.finished = true
+    return {
+      meta: this.meta,
+      events: this.events,
+      cursor: this.nextSeq - 1,
+      hasMore: this.events.length > 0 && this.events[0]?.seq !== 0,
+      committedBytes: this.committedBytes,
+    }
   }
 
   /** Decode one complete event row and update the contiguous prefix. */
@@ -393,10 +428,12 @@ export class SessionLogScanner {
     }
 
     const rowStart = this.events.length
+    const rowSeqStart = this.nextSeq
     for (const event of decoded) {
-      if (event.seq !== this.events.length) {
-        const expected = this.events.length
+      if (event.seq !== this.nextSeq) {
+        const expected = this.nextSeq
         this.events.length = rowStart
+        this.nextSeq = rowSeqStart
         this.issue = new Error(
           `corrupt session log: seq gap in committed region at line ${this.eventLine} `
           + `(expected ${expected}, got ${event.seq})`,
@@ -404,7 +441,13 @@ export class SessionLogScanner {
         if (decoded.some(candidate => candidate.type === 'turn/end')) throw this.issue
         return
       }
-      this.events.push(event)
+      this.nextSeq += 1
+      if (this.window === undefined || event.seq < (this.window.beforeSeq ?? Number.MAX_SAFE_INTEGER)) {
+        this.events.push(event)
+      }
+    }
+    if (this.window !== undefined && this.events.length > this.window.maxEvents) {
+      this.events.splice(0, this.events.length - this.window.maxEvents)
     }
     this.committedBytes = endByte
   }
@@ -424,6 +467,28 @@ export function scanLog(buffer: Buffer): SessionLogScan {
   const scanner = new SessionLogScanner(buffer.subarray(0, headerEnd + 1))
   scanner.write(buffer.subarray(headerEnd + 1))
   return scanner.finish()
+}
+
+/**
+ * Stream a plaintext JSONL artifact while retaining only one logical window.
+ * @param buffer - raw complete or torn JSONL bytes.
+ * @param beforeSeq - exclusive upper sequence bound; omitted selects the tail.
+ * @param maxEvents - maximum logical events retained.
+ * @returns the bounded window plus complete cursor and committed byte count.
+ */
+export function scanLogWindow(
+  buffer: Buffer,
+  beforeSeq: number | undefined,
+  maxEvents: number,
+): SessionLogWindowScan {
+  const headerEnd = buffer.indexOf(0x0A)
+  if (headerEnd === -1) throw new Error('empty or header-less session log')
+  const scanner = new SessionLogScanner(
+    buffer.subarray(0, headerEnd + 1),
+    { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents },
+  )
+  scanner.write(buffer.subarray(headerEnd + 1))
+  return scanner.finishWindow()
 }
 
 /**

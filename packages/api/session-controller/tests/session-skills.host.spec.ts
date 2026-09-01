@@ -12,7 +12,7 @@ function observation(
   options: { readonly cwd?: string; readonly agentPreset?: string } = {},
 ): SessionObservation {
   const events = Object.freeze([])
-  const lease = (): SessionObservation => ({
+  return {
     source: 'live',
     header: {
       version: 0,
@@ -28,10 +28,8 @@ function observation(
         ...options.agentPreset === undefined ? {} : { agentPreset: options.agentPreset },
       },
     },
-    retain: lease,
     [Symbol.dispose]: () => {},
-  })
-  return lease()
+  }
 }
 
 async function context(): Promise<Context> {

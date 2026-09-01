@@ -24,11 +24,6 @@ export interface SessionObservation extends Disposable {
   readonly revision?: SessionPersistenceRevision
   /** Exact projection baseline at {@link cursor}, when the registry is mounted. */
   readonly projections?: ProjectionSnapshot
-  /**
-   * Retain the same immutable cut for another Host owner.
-   * @returns an independently disposable lease over this observation.
-   */
-  retain(): SessionObservation
 }
 
 /** Projection work and cancellation requested for one exact observation. */
@@ -116,30 +111,20 @@ export class SessionObservationReader {
             { cause: error },
           )
         }
-        let references = 1
-        const lease = (): SessionObservation => {
-          let disposed = false
-          return {
-            source: 'prepared',
-            header: prepared.inspection.meta,
-            events,
-            cursor: events.at(-1)?.seq ?? -1,
-            revision: prepared.revision,
-            ...projections === undefined ? {} : { projections },
-            retain: () => {
-              if (disposed || references === 0) throw new Error(`session observation "${sessionId}" is disposed`)
-              references += 1
-              return lease()
-            },
-            [Symbol.dispose]: () => {
-              if (disposed) return
-              disposed = true
-              references -= 1
-              if (references === 0) prepared[Symbol.dispose]()
-            },
-          }
+        let disposed = false
+        return {
+          source: 'prepared',
+          header: prepared.inspection.meta,
+          events,
+          cursor: events.at(-1)?.seq ?? -1,
+          revision: prepared.revision,
+          ...projections === undefined ? {} : { projections },
+          [Symbol.dispose]: () => {
+            if (disposed) return
+            disposed = true
+            prepared[Symbol.dispose]()
+          },
         }
-        return lease()
       } catch (error: unknown) {
         borrowed[Symbol.dispose]()
         throw error
@@ -155,22 +140,14 @@ export class SessionObservationReader {
     const projections = projectionMode === 'none'
       ? undefined
       : this.ctx.get('sessionProjections')?.snapshot(session)
-    const lease = (): SessionObservation => {
-      let disposed = false
-      return {
-        source: 'live',
-        header: session.header,
-        events,
-        cursor: events.at(-1)?.seq ?? -1,
-        ...projections === undefined ? {} : { projections },
-        retain: () => {
-          if (disposed) throw new Error(`session observation "${session.id}" is disposed`)
-          return lease()
-        },
-        [Symbol.dispose]: () => { disposed = true },
-      }
+    return {
+      source: 'live',
+      header: session.header,
+      events,
+      cursor: events.at(-1)?.seq ?? -1,
+      ...projections === undefined ? {} : { projections },
+      [Symbol.dispose]: () => {},
     }
-    return lease()
   }
 
   private preparedProjections(

@@ -47,7 +47,7 @@ flowchart LR
 
 `SessionQueryEngine.observeSession(sessionId, options)` 返回可 dispose（资源释放）的 `SessionObservation`，其中包含同一份 source kind、header、连续事件前缀、cursor、可选 projection snapshot，以及 prepared source 的持久化 revision。已挂载 Session 优先；否则 `SessionPersistence.borrowSession()` 与 `SessionPreparations.borrow()` 共享并固定一份 prepared Session，包括尚未完成的冷加载。
 
-每个 owner 都会 dispose 自己的 observation。`retain()` 为同一切面创建另一份 lease，使 `session.follow` 能够先发布 snapshot，再把完全相同的 prepared source 转交给后台 Agent promotion，而无需重读日志。冷解析期间出现的 live Session 会在发布前胜出；已经消失的 live source 会按 cold source 重试。
+每个 owner 都会 dispose 自己的 observation。一份 prepared observation 只有一个 owner，并且只释放一次借用的 source。`session.follow` 会分离有界 opening response，并在等待 live event 前 dispose observation，因此 follower 生命周期不会固定完整的 prepared Session。冷解析期间出现的 live Session 会在发布前胜出；已经消失的 live source 会按 cold source 重试。
 
 ### 数据源解析与生命周期
 
@@ -57,7 +57,7 @@ flowchart LR
 
 只有在不存在已挂载 Session 后，persistence absence 才映射为 Session-not-found。持久数据损坏、source identity 冲突、取消和 persistence 操作失败分别保留不同的 `SessionQueryError`，API owner 因而可以维持自身公开错误词汇，而不用重复数据源判定。
 
-Observation 不拥有任何 mutation 权限。其事件数组是不可变前缀，prepared Session 保持未发布。Promotion 是 Session Controller 在 opening snapshot 发出后执行的显式 ownership transfer；其他读方不能把 observation 变成 live Agent。
+Observation 不拥有任何 mutation 权限。其事件数组是不可变前缀，prepared Session 保持未发布。读取操作不能把 observation 变成 live Agent。后续 activation policy 允许恢复的操作会独立解析 Agent。
 
 Projection 工作明确只有 `all | none` 两种模式。`all` 在 observation 的事件 cursor 上计算所有已注册 projection；`none` 完全不触碰 projection 状态。系统不存在按 key preparation 的状态、`projectionKeys` 模式或额外的 `viewedState`／`viewedValue` cache。发布方可以按 audience 筛选已完成的值，但底层 observation 不会处于只算完部分 projection 的状态。
 
@@ -73,7 +73,7 @@ Registry 拥有 fold state；各领域拥有自己的 `init`、`apply`、`view`�
 
 语料库 list 仍是独立的轻量操作。`listSessions()` 返回 live-preferred header，而不物化每份日志。Session list 与 subagent list 先读取 live projection 状态或持久 projection-cache row。当 cache 无法判断 Session 是否为空，且该 Session 拥有的独立产物未超过配置的小日志限制时，Session list 可以执行一次完整 observation；大型或不可读的 cache miss 仍以 hints 未知但 row 可见的方式返回。
 
-`session.follow` 发布必需的 opening snapshot，其中包含 header、cursor、首个事件窗口和完整 projection baseline。重连使用另一份完整 snapshot 替换上一 generation。`session.page` 仅用于旧历史读取与 gap repair。只读 observation 不激活 Agent；只有普通 follow 可以保留 prepared observation，并在 opening snapshot 已交付后请求 promotion。
+`session.follow` 发布必需的 opening snapshot，其中包含 header、cursor、首个事件窗口和完整 projection baseline。历史响应先应用所请求的消息限制，再至多保留配置的逻辑事件数，因此单条异常长消息无法生成无界 JSON frame。Opening 会分离这些有界值，并在等待前释放完整 observation。重连使用另一份完整 snapshot 替换上一 generation。`session.page` 仅用于旧历史读取与 gap repair。只读 observation 不激活 Agent。如果后续显式操作恢复 Session，follower 会在 `session/created` 后衔接 live suffix，而不保留或 promote cold source。
 
 ### 读取 audience
 
@@ -83,7 +83,7 @@ Registry 拥有 fold state；各领域拥有自己的 `init`、`apply`、`view`�
 |---|---|---|---|
 | `session.list` | Corpus header、live state 和 cached row；有界小日志 fallback | 部分 hints，或一次完整小日志 observation | 从不 |
 | `session.search` | Corpus 鉴权加已配置 search provider | 结果列表不计算 | 从不 |
-| `session.follow` | 一份精确 observation | 全算，并由 opening snapshot 携带 | 仅普通 cold Session，且在 snapshot 交付后 |
+| `session.follow` | 一份精确 observation，分离 opening 后释放 | 全算，并由 opening snapshot 携带 | 从不 |
 | `session.page` | 一份精确 observation | 不计算，但 projection-backed subagent 鉴权除外 | 从不 |
 | Attachment 与 fork source | 一份精确 observation | 鉴权不要求时不计算 | source 从不激活 |
 | Subagent list 与 continuation | Corpus 加 live/cache/observation 解析 | cold fallback 全算；audience 只消费 identity 或继承值 | Listing 从不；continuation 遵循显式命令语义 |
@@ -172,7 +172,7 @@ Client 本地交互状态也继续留在本地：loading 和 error 状态、打�
 
 ## 验证
 
-Persistence 与 SessionQuery 测试固定共享冷加载、取消、live-source race、retained observation、dispose 和 all-or-none projection 计算。Session Controller 与 Gateway 测试固定 snapshot-first opening、replacement reconnect、旧分页读取、gap repair、list-cache hints、小日志有界 fallback，以及 snapshot 交付后的 promotion。
+Persistence 与 SessionQuery 测试固定共享冷加载、取消、live-source race、exactly-once dispose 和 all-or-none projection 计算。Session Controller 与 Gateway 测试固定 snapshot-first opening、逻辑事件响应上限、live wait 前释放、replacement reconnect、旧分页读取、gap repair、list-cache hints、小日志有界 fallback、不由读取触发 activation，以及衔接后续 live suffix。
 
 Client 测试固定 higher-sequence-wins projection store、title 更新、model catalog 与 selection readiness、preset roster refresh 与 Session 专属选择，以及不会短暂展示离线状态的 subagent loading。Subagent 测试固定 corpus 枚举、cache 与 observation fallback、lifecycle witness、有界冷读，以及 listing 期间不激活 Agent。
 
@@ -181,6 +181,8 @@ Client 测试固定 higher-sequence-wins projection store、title 更新、model
 **由各消费方继续解析数据源。** 否决，因为每个调用方都需要重复实现 live race、persistence error mapping、preparation lifetime、cancellation 和 projection cut，既会重复工作，也会产生不一致结果。
 
 **每次精确读取都激活 Agent。** 否决，因为 list、history、attachment、search 与 subagent inspection 都是读取操作。Activation 会加载插件并改变进程状态，也没有适合分页或 catalog 读取的自然退出点。
+
+**在 follow snapshot 后 promote cold Session。** 否决，因为 follower 与浏览器连接同寿命，所以 promotion 会把只读观察变成 Agent，并保留完整展开的 event log。即使用户只读取有界 opening page，大型 conversation 仍会常驻内存。显式 Agent 操作已经拥有 resume，其 `session/created` event 可让 follower 衔接 live suffix，无需 promotion。
 
 **只 prepare 被请求的 projection key。** 否决，因为只完成部分 projection 的 Session 会增加一种生命周期状态，所有 cache、restore、plugin registration 和调用路径都必须追踪它。Projection unit 数量少且为纯函数；精确 observation 计算全部已注册 unit，比为了 `O(E*k)` 而维护部分状态、取代 `O(E*P)` 完整状态更简单。
 
@@ -194,8 +196,8 @@ Client 测试固定 higher-sequence-wins projection store、title 更新、model
 
 ## 后果
 
-Session 消费方共享一份 live-preferred read model 和一个 prepared cold object。Header、events、cursor 与 projections 属于同一 observation，普通页面打开还可以为后续 promotion 复用该对象。新的 point-read 消费方使用 SessionQuery，而不再自行拼接 persistence 与 registry 调用。
+Session 消费方共享一份 live-preferred read model 和一个 prepared cold object。Header、events、cursor 与 projections 属于同一 observation。Follow 只保留分离后的有界 response；后续会激活 Agent 的操作单独执行 resume。新的 point-read 消费方使用 SessionQuery，而不再自行拼接 persistence 与 registry 调用。
 
 Session 派生 Client 状态只有一条扩展路径：记录或识别持久输入、注册纯 projection unit，再通过通用 store 消费其成品值。不由 Session 派生的领域 catalog 可以独立存在，但不能用默认值替代未知的 Session projection。
 
-更简单的状态模型接受有界的额外计算。精确的 projected cold observation 会计算所有已注册 unit，小型且 cache miss 的 list artifact 可能完整读取。大型 list row 在打开前可以保持部分描述，因此每个 list 消费方必须保留 unknown、capability absent 和 explicit no value 的区别。Observation lease 还使 dispose 成为调用方约定的一部分；保留 prepared source 而不释放会阻止正常 cache retirement。
+更简单的状态模型接受有界的额外计算。精确的 projected cold observation 会计算所有已注册 unit，小型且 cache miss 的 list artifact 可能完整读取。大型 list row 在打开前可以保持部分描述，因此每个 list 消费方必须保留 unknown、capability absent 和 explicit no value 的区别。如果一条逻辑消息本身的事件数超过配置的响应限制，历史页可以从该消息内部开始；向后分页会恢复此前连续前缀。Observation ownership 还使 dispose 成为调用方约定的一部分；持有 prepared source 会阻止正常 cache retirement。

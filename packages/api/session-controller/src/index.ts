@@ -5,7 +5,6 @@ import z from '@deepseek-ai/schemastery'
 import { errorChain } from '@deepseek-ai/dsh-llm'
 import { canOpenNativePath, openNativePath } from '@deepseek-ai/dsh-native-command'
 import type { SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionObservation } from '@deepseek-ai/dsh-session-query'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import {
   ApiSessionAgentController,
@@ -14,7 +13,7 @@ import {
 } from './agent.ts'
 import { SessionCommandController } from './commands.ts'
 import { SessionControlController } from './control.ts'
-import { SessionHistoryController } from './history.ts'
+import { DEFAULT_HISTORY_PAGE_MAX_EVENTS, SessionHistoryController } from './history.ts'
 import { SessionFileReferences } from './file-references.ts'
 import { ApiSessionList, DEFAULT_COLD_BLANK_PROBE_MAX_BYTES } from './list.ts'
 import { buildModelCatalog } from './catalog.ts'
@@ -67,6 +66,8 @@ declare module '@deepseek-ai/cordis' {
 export interface Config {
   /** Maximum cold Session artifact size eligible for one full projection observation. */
   readonly coldBlankProbeMaxBytes?: number
+  /** Maximum logical events returned by one history page or follow opening. */
+  readonly historyPageMaxEvents?: number
   /** Override platform desktop-opener detection. */
   readonly nativeOpen?: boolean
 }
@@ -95,6 +96,8 @@ export class SessionController extends TypertRemoteService {
 
   static Config: z<Config> = z.object({
     coldBlankProbeMaxBytes: z.natural().default(DEFAULT_COLD_BLANK_PROBE_MAX_BYTES),
+    historyPageMaxEvents: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER)
+      .default(DEFAULT_HISTORY_PAGE_MAX_EVENTS),
     nativeOpen: z.boolean(),
   })
 
@@ -105,7 +108,6 @@ export class SessionController extends TypertRemoteService {
   private readonly listState: ApiSessionList
   private readonly openPath: (path: string, signal: AbortSignal) => Promise<void>
   private readonly canOpenPath: () => boolean
-  private readonly promotions = new Set<Promise<void>>()
 
   /**
    * @param ctx - Host context containing the Session capability assembly.
@@ -117,12 +119,10 @@ export class SessionController extends TypertRemoteService {
     this.agents = new ApiSessionAgentController(ctx)
     this.commands = new SessionCommandController(ctx, this.agents, process.cwd())
     this.controlState = new SessionControlController(ctx)
-    // Registered before history so reverse-order teardown closes every
-    // follower before waiting for already-admitted promotions.
-    ctx.effect(() => async () => {
-      await Promise.allSettled([...this.promotions])
-    }, 'session-controller.promotions')
-    this.history = new SessionHistoryController(ctx, (observation) => { this.promote(observation) })
+    this.history = new SessionHistoryController(
+      ctx,
+      config.historyPageMaxEvents ?? DEFAULT_HISTORY_PAGE_MAX_EVENTS,
+    )
     this.listState = new ApiSessionList(
       ctx,
       config.coldBlankProbeMaxBytes ?? DEFAULT_COLD_BLANK_PROBE_MAX_BYTES,
@@ -158,19 +158,6 @@ export class SessionController extends TypertRemoteService {
       if (event.type !== 'user/message' || event.data.source.kind !== 'user') return
       ctx.emit('api-session/activity', session.id, event.time)
     })
-  }
-
-  private promote(observation: SessionObservation): void {
-    const sessionId = observation.header.id
-    const task = (async () => {
-      using ownedObservation = observation
-      const result = await this.agents.resolveObservedAgent(ownedObservation)
-      if ('error' in result) this.ctx.emit('api-session/error', sessionId, result.error.message)
-    })().catch((error: unknown) => {
-      this.ctx.logger.error(`session-controller: background activation for "${sessionId}" failed: ${errorChain(error)}`)
-    })
-    this.promotions.add(task)
-    void task.finally(() => { this.promotions.delete(task) })
   }
 
   /**

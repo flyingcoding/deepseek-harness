@@ -91,7 +91,7 @@ Each `session/event` copies the event into its session's controller. The first p
 
 ### Stored-record compatibility
 
-Backend reads normalize only the explicitly supported v0 record variants before validating current records. The coordinator uses the same normalized view for `load`, `inspect`, `readFrom`, ownerless-state claims, and HMR adoption. Reads do not rewrite stored records, and later appends use current v0. The [pre-identity message](../../../.agents/notes/implemented/bug-fix/2026-07-28-load-pre-identity-session-messages.md) and [pre-react-loop session](../../../.agents/notes/implemented/bug-fix/2026-08-04-load-pre-react-loop-sessions.md) notes own these bounded exceptions; they are not a general format-migration promise.
+Backend reads normalize only the explicitly supported v0 record variants before validating current records. The coordinator uses the same normalized view for `load`, `inspect`, `readFrom`, `readWindow`, ownerless-state claims, and HMR adoption. A backend window hook may validate prefix continuity without retaining earlier records; if its returned suffix contains a legacy event that needs preceding message identity, the coordinator falls back to the complete normalized prefix. Reads do not rewrite stored records, and later appends use current v0. The [pre-identity message](../../../.agents/notes/implemented/bug-fix/2026-07-28-load-pre-identity-session-messages.md) and [pre-react-loop session](../../../.agents/notes/implemented/bug-fix/2026-08-04-load-pre-react-loop-sessions.md) notes own these bounded exceptions; they are not a general format-migration promise.
 
 </details>
 -----

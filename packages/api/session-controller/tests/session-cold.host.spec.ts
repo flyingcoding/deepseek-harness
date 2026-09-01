@@ -291,7 +291,7 @@ describe('sessions.list cold merge', () => {
     }])
     vi.spyOn(ctx.sessionQuery, 'observeSession').mockResolvedValue({
       source: 'prepared', header: meta, events: [], cursor: -1,
-      retain: vi.fn(), [Symbol.dispose]: vi.fn(),
+      [Symbol.dispose]: vi.fn(),
     })
     const list = new ApiSessionList(ctx, 1024)
 
@@ -456,7 +456,7 @@ describe('Remote Agent and Session lookup policy', () => {
 
     await expect(resolvedAgent).resolves.toBe(resumedAgent)
     await expect(resolvedSession).resolves.toBe(resumedSession)
-    expect(inspect).not.toHaveBeenCalled()
+    expect(inspect).toHaveBeenCalledOnce()
   })
 
   it('preserves the subagent ownership fence for cold and live Remote lookups', async () => {
@@ -501,7 +501,7 @@ describe('Remote Agent and Session lookup policy', () => {
     await expect(coldFailure).rejects.toMatchObject(ownershipFailure)
     await expect(liveFailure).rejects.toMatchObject(ownershipFailure)
     expect(resume).not.toHaveBeenCalled()
-    expect(inspect).not.toHaveBeenCalled()
+    expect(inspect).toHaveBeenCalledOnce()
   })
 })
 
@@ -547,10 +547,7 @@ describe('subagent ownership fence', () => {
     const remote = createSessionTestRemote(ctx, { defaultModelSelection: () => ({ provider: 'p', model: 'm' }), cwd: '/tmp' })
     ctx.sessionProjections.register(subagentIdentityProjectionDefinition)
 
-    const history = await new SessionHistoryController(
-      ctx,
-      (observation) => { observation[Symbol.dispose]() },
-    ).page({
+    const history = await new SessionHistoryController(ctx).page({
       address: {
         kind: 'subagent',
         parentSessionId: meta.parentSession as SessionId,
@@ -581,7 +578,7 @@ describe('subagent ownership fence', () => {
     if (!create.ok) expect(create.error.code).toBe('session/agent-busy')
     expect(resume).not.toHaveBeenCalled()
     expect(ctx.agents.get(sessionId)).toBeUndefined()
-    expect(inspect).toHaveBeenCalledOnce()
+    expect(inspect).toHaveBeenCalledTimes(3)
   })
 
   it('no longer treats a descriptor-only cold child without origin as subagent-owned', async () => {

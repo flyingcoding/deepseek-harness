@@ -412,6 +412,7 @@ export const LINK_MAP: Readonly<Record<string, string>> = {
   SessionLocation: 'persistence.md',
   SessionPreparation: 'persistence.md',
   SessionPersistenceSnapshot: 'persistence.md',
+  SessionPersistenceWindow: 'persistence.md',
   SessionRawArtifact: 'persistence.md',
   ConfinedArgv: 'sandbox.md',
   SandboxExecutionPolicy: 'sandbox.md',
