@@ -1420,6 +1420,39 @@ describe('built-in conversation node Definitions', () => {
     ])
   })
 
+  it('hides a provisional window prompt when prepend proves it repeats the preceding header', () => {
+    const value = assembler([
+      at(10, 'request/header', {
+        reason: 'change',
+        header: { config: { provider: 'fake', model: 'fake' }, system: '# Same prompt' },
+      }),
+    ], true)
+    const provisional = node(snapshot(value), 'system-prompt')
+
+    expect(provisional?.visibility).toBe('visible')
+
+    value.prepend([
+      at(5, 'request/header', {
+        reason: 'initial',
+        header: { config: { provider: 'fake', model: 'fake' }, system: '# Same prompt' },
+      }),
+    ], false)
+    expect(() => value.flush()).not.toThrow()
+
+    const restored = snapshot(value)
+    const prompts = restored.nodes.values()
+      .filter(candidate => candidate.kind === 'system-prompt')
+    expect(prompts.map(prompt => ({
+      anchorSeq: prompt.anchorSeq,
+      visibility: prompt.visibility,
+    }))).toEqual([
+      { anchorSeq: 10, visibility: 'hidden' },
+      { anchorSeq: 5, visibility: 'visible' },
+    ])
+    expect(prompts.find(prompt => prompt.anchorSeq === 10)?.key).toBe(provisional?.key)
+    expect(restored.order).not.toContain(provisional?.key)
+  })
+
   it('orders the system field before the request messages while preserving message order', () => {
     const value = assembler([
       at(1, 'turn/start', { turn: 1 }),
