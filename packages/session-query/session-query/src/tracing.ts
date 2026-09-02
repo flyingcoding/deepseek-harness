@@ -1,7 +1,13 @@
 /** One-shot session-lineage and event-relationship tracing helpers. */
 
 import { foldSurface, isSurfaceEvent, snapshotSessionEvent } from '@deepseek-ai/dsh-session'
-import type { SessionEvent, SessionId, SurfaceEvent, SurfaceEventType } from '@deepseek-ai/dsh-session'
+import type {
+  SessionEvent,
+  SessionId,
+  SessionSeq,
+  SurfaceEvent,
+  SurfaceEventType,
+} from '@deepseek-ai/dsh-session'
 import { SessionQueryError } from './config.ts'
 import type {
   SessionEventRecord,
@@ -11,15 +17,11 @@ import type {
   SessionRecord,
 } from './types.ts'
 
-interface EventLogMaps {
-  current: Set<number>
-  replacedBy: Map<number, number>
-  replacedEventSeqs: Map<number, number[]>
-  currentSeqs: number[]
-}
-
-interface EventLogAnalysis extends EventLogMaps {
+interface EventLogAnalysis {
   records: SessionEventRecord[]
+  replacedBy: Map<SessionSeq, SessionSeq>
+  replacedEventSeqs: Map<SessionSeq, SessionSeq[]>
+  currentSeqs: SessionSeq[]
 }
 
 /**
@@ -45,13 +47,13 @@ export function currentSurfaceEvents(
   sessionId: SessionId,
   events: readonly SessionEvent[],
 ): SurfaceEvent[] {
-  const analysis = analyzeEventLogMaps(events)
+  const analysis = analyzeEventLog(sessionId, events)
   return analysis.currentSeqs.map((seq) => {
     const event = events[seq]
     /* v8 ignore next 6 -- analyzeEventLog validated contiguous seqs and foldSurface returned only surface-event seqs. */
     if (event === undefined || event.seq !== seq || !isSurfaceEvent(event)) {
       throw new SessionQueryError(
-        `invalid session surface: current node ${seq} of session "${sessionId}" is not a surface event`,
+        `invalid session surface: current node ${seq} is not a surface event`,
         'SESSION_QUERY_INVALID_SURFACE',
       )
     }
@@ -69,7 +71,7 @@ export function currentSurfaceEvents(
 export function traceEvent(
   sessionId: SessionId,
   events: readonly SessionEvent[],
-  seq: number,
+  seq: SessionSeq,
 ): SessionEventTrace {
   const target = events[seq]
   if (target === undefined || target.seq !== seq) {
@@ -79,32 +81,24 @@ export function traceEvent(
     )
   }
 
-  // The lean fold avoids materializing one record object per event: the
-  // target record is the only record this trace retains.
-  const analysis = analyzeEventLogMaps(events)
+  const analysis = analyzeEventLog(sessionId, events)
 
-  const replacementChain: number[] = []
+  const replacementChain: SessionSeq[] = []
   let replacement = analysis.replacedBy.get(seq)
   while (replacement !== undefined) {
     replacementChain.push(replacement)
     replacement = analysis.replacedBy.get(replacement)
   }
 
-  const derivedEventSeqs: number[] = []
+  const derivedEventSeqs: SessionSeq[] = []
   for (const event of events) {
     if (event.seq <= seq) continue
     if (eventSources(event).includes(seq)) derivedEventSeqs.push(event.seq)
   }
 
-  const targetRecord: SessionEventRecord = {
-    sessionId,
-    seq: target.seq,
-    type: target.type,
-    time: target.time,
-    surface: analysis.current.has(target.seq)
-      ? 'current'
-      : analysis.replacedBy.has(target.seq) ? 'shadowed' : 'log-only',
-  }
+  // The target check above proves the parallel record exists at this index.
+  // oxlint-disable-next-line typescript/no-non-null-assertion
+  const targetRecord = analysis.records[seq]!
   const replacedBy = analysis.replacedBy.get(seq)
   return {
     target: targetRecord,
@@ -188,35 +182,6 @@ function analyzeEventLog(
   sessionId: SessionId,
   events: readonly SessionEvent[],
 ): EventLogAnalysis {
-  const maps = analyzeEventLogMaps(events)
-  return {
-    records: events.map(event => recordFor(event, sessionId, maps)),
-    ...maps,
-  }
-}
-
-/** Classify one event's folded surface against precomputed maps. */
-function recordFor(
-  event: SessionEvent,
-  sessionId: SessionId,
-  maps: EventLogMaps,
-): SessionEventRecord {
-  return {
-    sessionId,
-    seq: event.seq,
-    type: event.type,
-    time: event.time,
-    surface: maps.current.has(event.seq)
-      ? 'current'
-      : maps.replacedBy.has(event.seq) ? 'shadowed' : 'log-only',
-  }
-}
-
-/**
- * Fold one log into its relationship maps without a per-event record array,
- * so traces and surface reads stay linear in allocation-free light state.
- */
-function analyzeEventLogMaps(events: readonly SessionEvent[]): EventLogMaps {
   let folded: ReturnType<typeof foldSurface>
   try {
     folded = foldSurface(events)
@@ -229,8 +194,8 @@ function analyzeEventLogMaps(events: readonly SessionEvent[]): EventLogMaps {
     )
   }
   const current = new Set(folded.nodes)
-  const replacedBy = new Map<number, number>()
-  const replacedEventSeqs = new Map<number, number[]>()
+  const replacedBy = new Map<SessionSeq, SessionSeq>()
+  const replacedEventSeqs = new Map<SessionSeq, SessionSeq[]>()
   for (const replacement of folded.replacements) {
     const removed = replacement.shadowedSeqs
     replacedEventSeqs.set(replacement.seq, removed)
@@ -239,14 +204,22 @@ function analyzeEventLogMaps(events: readonly SessionEvent[]): EventLogMaps {
     }
   }
   return {
-    current,
+    records: events.map(event => ({
+      sessionId,
+      seq: event.seq,
+      type: event.type,
+      time: event.time,
+      surface: current.has(event.seq)
+        ? 'current'
+        : replacedBy.has(event.seq) ? 'shadowed' : 'log-only',
+    })),
     replacedBy,
     replacedEventSeqs,
     currentSeqs: [...folded.nodes],
   }
 }
 
-function eventSources(event: SessionEvent): readonly number[] {
+function eventSources(event: SessionEvent): readonly SessionSeq[] {
   return (event as SessionEvent<SurfaceEventType>).sourceEventSeqs ?? []
 }
 

@@ -1,29 +1,34 @@
 /** Live/persisted logical-corpus resolution for session-query. */
 
 import type { Context, Fiber } from '@deepseek-ai/cordis'
-import type { Session, SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
+import type {
+  Session,
+  SessionEvent,
+  SessionHeader,
+  SessionId,
+  SessionLogOffset,
+} from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
 import type { SessionRecord } from './types.ts'
 import { SessionQueryError } from './config.ts'
 import { assertSessionHeadersCompatible } from './sources.ts'
 
-/** Source selected for one exact read. */
+/** Detached source selected for one exact read. */
 export interface LogicalSession {
   /** Cloned source header. */
   header: SessionHeader
-  /**
-   * Raw event log borrowed from the live frozen snapshot, or freshly
-   * inspected and owned by this read. Callers treat it as immutable and
-   * clone every value they retain: full-log copies are the OOM the corpus
-   * must never reintroduce.
-   */
-  events: readonly SessionEvent[]
+  /** Exact fork-inherited event count paired with {@link header}. */
+  inheritedEventCount: SessionLogOffset
+  /** Cloned raw event log. */
+  events: SessionEvent[]
 }
 
 /** Borrowed source visible only during one synchronous batch projection. */
 export interface LogicalSessionSource {
   /** Header selected with `events`; callers must clone retained output. */
   readonly header: SessionHeader
+  /** Exact fork-inherited event count paired with {@link header}. */
+  readonly inheritedEventCount: SessionLogOffset
   /** Raw events selected with `header`; valid only for the projection call. */
   readonly events: readonly SessionEvent[]
 }
@@ -82,15 +87,13 @@ export class SessionCorpus {
   }
 
   /**
-   * Load one logical source, preferring a borrowed live snapshot.
+   * Load one logical source, preferring a detached live snapshot.
    *
    * A known live target never consults persistence, so an optional backend's
-   * failure cannot make current in-memory history unreadable. Events are the
-   * live session's frozen snapshot array (replaced, never mutated, on append)
-   * or freshly inspected values; the load never copies the whole log.
+   * failure cannot make current in-memory history unreadable.
    * @param sessionId - session to resolve.
    * @param signal - optional cancellation for persisted source resolution.
-   * @returns live-preferred header and events, immutable for the duration of the read.
+   * @returns detached live-preferred header and events.
    */
   async load(sessionId: SessionId, signal?: AbortSignal): Promise<LogicalSession> {
     signal?.throwIfAborted()
@@ -114,9 +117,13 @@ export class SessionCorpus {
       return snapshot
     }
     assertSessionHeadersCompatible(loaded.meta, listed)
-    // inspect() hands over fresh detached values unique to this read.
+    const snapshot = {
+      header: structuredClone(loaded.meta),
+      inheritedEventCount: loaded.inheritedEventCount,
+      events: loaded.events.map(event => structuredClone(event)),
+    }
     signal?.throwIfAborted()
-    return { header: structuredClone(loaded.meta), events: loaded.events }
+    return snapshot
   }
 
   /**
@@ -189,6 +196,7 @@ export class SessionCorpus {
         assertSessionHeadersCompatible(loaded.meta, listed)
         resolved.set(sessionId, projectSource(sessionId, {
           header: loaded.meta,
+          inheritedEventCount: loaded.inheritedEventCount,
           events: loaded.events,
         }, project, signal))
       } catch (error: unknown) {
@@ -243,7 +251,11 @@ function projectSource<Value>(
 }
 
 function sourceLive(session: Session): LogicalSessionSource {
-  return { header: session.header, events: session.events }
+  return {
+    header: session.header,
+    inheritedEventCount: session.inheritedEventCount,
+    events: session.snapshotEvents(),
+  }
 }
 
 function orderedResults<Value>(
@@ -294,12 +306,10 @@ async function inspectPersisted(
 }
 
 function snapshotLive(session: Session): LogicalSession {
-  // `events` is the session's frozen snapshot array: safe to borrow because
-  // appends replace it and events themselves are deep-frozen. Cloning it
-  // would double a multi-million-event log for every exact read.
   return {
     header: structuredClone(session.header),
-    events: session.events,
+    inheritedEventCount: session.inheritedEventCount,
+    events: session.snapshotEvents().map(event => structuredClone(event)),
   }
 }
 
