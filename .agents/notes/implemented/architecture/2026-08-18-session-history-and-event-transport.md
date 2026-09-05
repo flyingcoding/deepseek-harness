@@ -136,6 +136,8 @@ If a page request is canceled with its physical carrier generation, the journal 
 
 ### Session Controller
 
+The command UI discovers Agent-bound commands only for an explicit candidate query or submission. Background prewarming would enter the general Agent lookup and defeat bounded cold history by resuming the complete Session.
+
 `packages/api/session-controller` provides Host `ctx.sessionController` and the generated `ctx.remote.session` namespace.
 
 It owns Session list, search, create, selectModel, rename, fork, prompt, attachment, updateQueue, cancel, page, follow, and control. The Host-generation model catalog is exposed separately through `session/modelCatalog` because it is not Session-specific.
@@ -153,8 +155,8 @@ Each method explicitly selects a cold inspection, live-only lookup, or resume-ca
 | Operation | Source or result without a live Agent | Activation rule |
 |---|---|---|
 | `session.list`, `search` | headers and projection cache; a bounded small-log read can resolve uncertain blankness | Never resumes an Agent |
-| `session.page(address)` | attached Session or a bounded persistence window | Never resumes an Agent |
-| `session.follow(address)` | live observation or bounded cold persistence window plus cached projections | Never resumes an Agent |
+| `session.page(address)` | attached Session or persistence log | Never resumes an Agent |
+| `session.follow(address)` | one live or prepared observation carrying the opening page and projections | Publishes the snapshot first; only a prepared ordinary source promotes in the background |
 | `session.control()` | current attached Agents, pending registry, and process-local registries | Baseline and reconnect do not resume an Agent |
 | `session.attachment`, fork source read | authorized durable Session data | A read does not resume an Agent |
 | `session.updateQueue`, `cancel` | only the current live Agent | Does not resume vanished state |
@@ -163,7 +165,7 @@ Each method explicitly selects a cold inspection, live-only lookup, or resume-ca
 
 Reading titles, lists, and projections does not require an Agent. An observation operation cannot inherit resume authority merely because another Remote endpoint uses Agent lookup.
 
-`SessionQuery.observeSession()` chooses an attached Session or borrows one prepared source from `SessionPersistence.borrowSession()`. The persistence preparation cache shares concurrent cold reads and pins the exact unpublished Session until every observation lease is released. An observation computes either all registered projections or none; callers may expose a subset, but no caller creates a partial projection state.
+`SessionQuery.observeSession()` chooses an attached Session or serves a cold one from the reader's own prepared cache, filled through a persistence read handle. The cache shares concurrent cold reads and pins an entry until every observation lease is released. An observation computes either all registered projections or none; callers may expose a subset, but no caller creates a partial projection state.
 
 `session.list` never performs an unbounded cold-log scan. It uses cached projection hints when available and may fully observe only an individually stored artifact within the configured small-log byte limit to distinguish an abandoned blank Session. Missing or unreadable hints keep the row visible with unknown metadata.
 
@@ -171,17 +173,17 @@ Reading titles, lists, and projections does not require an Agent. An observation
 
 #### Session journal
 
-`session.page` returns a history window with contiguous internal sequence numbers. Every request must carry an explicit `throughSeq`; this value comes from the corresponding `session.follow` generation's opening cursor and fixes the read at the same log cut. A tail page without `beforeSeq` must end exactly at `throughSeq`, where `-1` denotes an empty log. `beforeSeq` only selects an older page before that cut and cannot replace the synchronization cursor. `maxMessages` applies a message-aligned cut when it fits inside `historyPageMaxEvents`; an unusually large message may be split at the logical-event limit, and backwards paging restores its preceding contiguous prefix.
+`session.page` returns a history window clipped on message boundaries with contiguous internal sequence numbers. Every request must carry an explicit `throughSeq`; this value comes from the corresponding `session.follow` generation's opening cursor and fixes the read at the same log cut. A tail page without `beforeSeq` must end exactly at `throughSeq`, where `-1` denotes an empty log. `beforeSeq` only selects an older page before that cut and cannot replace the synchronization cursor. `maxMessages` limits user/assistant message count without dropping chunks, tools, or state events between those messages.
 
 The tail page also carries a projection baseline no later than `throughSeq`; older pages carry only historical entries. The Client merges pages and subsequent live control updates by projection watermark.
 
 Ordinary Sessions and direct subagents use one `SessionAddress` protocol. A direct-subagent address carries parent Session, child Session, and mode; a cold Host read verifies durable ownership and descriptor rather than authorizing access from the child id alone.
 
-`session.follow` installs `session/event` and `session/created` listeners before observing an attached Session or scanning a cold window.
+`session.follow` installs `session/event` and `session/created` listeners before observing an attached or prepared Session.
 
 The first follow response is a complete `{ type: 'snapshot', header, cursor, events, hasMore, projections }` frame. Every reconnect sends another complete snapshot replacement; the protocol has no `afterSeq`. Events committed during observation remain buffered and are emitted after the snapshot in sequence order.
 
-A cold ordinary Session reads its opening records through `SessionPersistence.readWindow()`. JSONL/Zstandard scans every physical row for sequence continuity but retains only the configured logical-event window, so opening a multi-million-event log does not construct a complete `Session.events` array. Cached projection rows supply the cold baseline; absence is represented by an empty baseline at sequence `-1`. The scan neither publishes nor promotes an Agent. A later explicit Agent operation resumes independently, and `session/created` bridges its suffix into the existing follower.
+A completed cold ordinary Session larger than the configured event window publishes a bounded snapshot without promotion; this keeps history viewing from retaining its complete log. Smaller or interrupted cold Sessions can publish their prepared snapshot immediately. After that first frame, the Controller transfers a retained observation to one background promotion; follow does not wait for activation. Direct-subagent addresses never use this promotion path.
 
 Client `SessionEventStream` extends `RemoteJournalStream` and supplies only `session.follow`, `session.page`, the Session sequence algorithm, and repair requests. The general layer validates and publishes the opening snapshot directly. It calls `session.page({ throughSeq })` only for older history or when a later event reveals a sequence gap.
 
@@ -342,7 +344,7 @@ Connection tests pin missing, duplicate, and withdrawn generation sources, readi
 
 `RemoteJournalStream` tests pin snapshot-first opening, contiguous append, historical prepend, reconnect replacement, gap repair, and one atomic replacement.
 
-Session Host tests pin bounded cold page/follow without full observation or attached Agents, contiguous events reaching a cold follow after an explicit prompt, direct-subagent ownership, event-capped pagination, and terminal-error projection. Persistence contract tests pin tail and earlier windows with the complete stored cursor; JSONL and Zstandard run that contract through streaming bounded retention.
+Session Host tests pin cold page/follow without increasing attached Agents, contiguous events reaching a cold follow after an explicit prompt, direct-subagent ownership, message-aligned pagination, and terminal-error projection.
 
 Session control tests pin baseline-first delivery, no cold-Session resume, attach/detach cleanup, queue and jobs replacement, and the projection watermark.
 
@@ -364,7 +366,7 @@ Static checks pin that API Proxy exports no Session/Workspace Host-frame carrier
 
 ## Consequences
 
-The browser can read a durable Session while its Agent is stopped. Opening an ordinary Session publishes the prepared snapshot before one background promotion begins; list, search, page, and other observation-only reads never activate it.
+The browser can read a durable Session while its Agent is stopped. Opening an ordinary prepared Session publishes its snapshot before one background promotion begins; a bounded cold-history opening stays inactive; list, search, page, and other observation-only reads never activate it.
 
 Durable logs repair a missing suffix by sequence number and page; Session control and Workspace state converge through opening snapshots; ordinary Remote Events promise no replay. Recovery semantics follow the data kind instead of imitating one another.
 

@@ -9,8 +9,9 @@
 // `/feedback` pins its expandable correlation ids. The seed is a recorded
 // fixture under the same record discipline as every other: DSH_SNAPSHOT=record drives the turn
 // live through the composer (real read tool against seeded workspace files)
-// and harvests session.jsonl; replay/refresh seed it cold and only render.
-import { readFile, writeFile, mkdir } from 'node:fs/promises'
+// and harvests session.v2.jsonl; replay/refresh seed it cold and only render.
+import { readFile, writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import type { Browser, Page } from 'playwright'
 import { chromium } from 'playwright'
@@ -30,7 +31,7 @@ import {
 import { expandOwningTurnProcess, newEnglishPage, saveFailureShot } from './support.ts'
 
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/seeded-history', import.meta.url))
-const SEED = fileURLToPath(new URL('../../../snapshots/web/seeded-history/session.jsonl', import.meta.url))
+const SEED = fileURLToPath(new URL('../../../snapshots/web/seeded-history/session.v2.jsonl', import.meta.url))
 const UI_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/seeded-history/ui.expected.md', import.meta.url))
 const UI_EXPANDED_EXPECTED = fileURLToPath(
   new URL('../../../snapshots/web/seeded-history/ui-expanded.expected.md', import.meta.url),
@@ -43,6 +44,41 @@ const MODE = webSnapshotMode()
 const SEED_ID = 'seeded-history-web-e2e'
 
 const PROMPT = 'Use the read tool twice in one assistant message: read a.txt and b.txt. Then reply with the single word DONE and stop.'
+
+it.skipIf(MODE === 'record')('pages recorded cold history within an event budget without activating an Agent', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-bounded-history-'))
+  let scaffold: WebScaffold | undefined
+  let browser: Browser | undefined
+  try {
+    const overlay = join(root, 'cordis.patch.yml')
+    await writeFile(overlay, '- id: session-controller\n  config:\n    historyPageMaxEvents: 8\n')
+    scaffold = await launchWebScaffold({ extraOverlayPath: overlay })
+    const seed = await readFile(SEED, 'utf8')
+    const sessionId = SessionId('bounded-seeded-history')
+    await seedSession(scaffold, seed, sessionId)
+    expect(scaffold.ctx.agents.get(sessionId) === undefined, 'seed has no active Agent').toBe(true)
+    expect(scaffold.ctx.sessions.get(sessionId) === undefined, 'seed has no attached Session').toBe(true)
+    browser = await chromium.launch()
+    const page = await newEnglishPage(browser)
+    const tripwire = watchConsole(page)
+    await page.goto(scaffold.authenticatedUrl, { waitUntil: 'load' })
+    await page.locator('[role="treeitem"]').first().click()
+    await page.locator('[role="treeitem"]').nth(1).click()
+    await page.getByText('DONE', { exact: true }).waitFor({ timeout: 15_000 })
+    expect(scaffold.ctx.agents.get(sessionId) === undefined, 'opening has no active Agent').toBe(true)
+    expect(scaffold.ctx.sessions.get(sessionId) === undefined, 'opening has no attached Session').toBe(true)
+    const earlier = page.getByRole('button', { name: 'Load earlier' })
+    await earlier.click()
+    await page.getByText(PROMPT, { exact: true }).waitFor({ timeout: 10_000 })
+    expect(scaffold.ctx.agents.get(sessionId) === undefined, 'paging has no active Agent').toBe(true)
+    expect(scaffold.ctx.sessions.get(sessionId) === undefined, 'paging has no attached Session').toBe(true)
+    expect(tripwire.pageErrors).toEqual([])
+  } finally {
+    await browser?.close()
+    await scaffold?.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 /**
  * Append a complete manual `/compact` lifecycle and valid compaction transaction
@@ -148,7 +184,7 @@ function withCompaction(raw: string, meter: TokenMeter): string {
   })
   at({
     type: 'user/message',
-    data: {
+    data: createUserMessage({
       content: [{
         type: 'text',
         text: '<context_checkpoint>Model-only compact checkpoint.</context_checkpoint>',
@@ -156,7 +192,7 @@ function withCompaction(raw: string, meter: TokenMeter): string {
       source: {
         kind: 'plugin', plugin: 'compact', compactionId, sourceCommandId: commandId,
       },
-    },
+    }),
     surfaceOp: { op: 'replace', start: first, end: last },
     sourceEventSeqs: [startSeq, summarySeq, ...surfaceSeqs],
   })
@@ -564,7 +600,7 @@ describe('web e2e: seeded history renders through cold resume', () => {
     expect(tripwire.warnings).toEqual([])
     await assertFixtureInventory(SNAPSHOT_DIR, [
       'command-row.expected.md', 'feedback-row.expected.md', 'file-open-failure.expected.md',
-      'session.jsonl', 'ui.expected.md', 'ui-expanded.expected.md',
+      'session.v2.jsonl', 'ui.expected.md', 'ui-expanded.expected.md',
     ])
   })
 })

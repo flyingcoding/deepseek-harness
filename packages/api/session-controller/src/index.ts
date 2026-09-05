@@ -3,9 +3,11 @@
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { errorChain } from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/dsh-client-file-upload'
 import { canOpenNativePath, openNativePath } from '@deepseek-ai/dsh-native-command'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionInspection } from '@deepseek-ai/dsh-session-persistence'
+import type { SessionObservation } from '@deepseek-ai/dsh-session-query'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import {
   ApiSessionAgentController,
@@ -16,7 +18,7 @@ import { SessionCommandController } from './commands.ts'
 import { SessionControlController } from './control.ts'
 import { DEFAULT_HISTORY_PAGE_MAX_EVENTS, SessionHistoryController } from './history.ts'
 import { SessionFileReferences } from './file-references.ts'
-import { ApiSessionList, DEFAULT_COLD_BLANK_PROBE_MAX_BYTES } from './list.ts'
+import { ApiSessionList } from './list.ts'
 import { buildModelCatalog } from './catalog.ts'
 import { installModelSelectionProjection } from './model-selection-projection.ts'
 import { SessionSkillCatalog } from './skill-catalog.ts'
@@ -65,12 +67,10 @@ declare module '@deepseek-ai/cordis' {
 
 /** Session Controller deployment policy. */
 export interface Config {
-  /** Maximum cold Session artifact size eligible for one full projection observation. */
-  readonly coldBlankProbeMaxBytes?: number
-  /** Maximum logical events returned by one history page or follow opening. */
-  readonly historyPageMaxEvents?: number
   /** Override platform desktop-opener detection. */
   readonly nativeOpen?: boolean
+  /** Maximum logical events in each history page or follow opening. Defaults to 20,000. */
+  readonly historyPageMaxEvents?: number
 }
 
 /** Host integrations replaceable by direct unit tests. */
@@ -87,6 +87,7 @@ export class SessionController extends TypertRemoteService {
     'agentDefaultModel',
     'agents',
     'attachments',
+    'fileUploads',
     'llm',
     'sessions',
     'sessionProjections',
@@ -96,10 +97,8 @@ export class SessionController extends TypertRemoteService {
   ]
 
   static Config: z<Config> = z.object({
-    coldBlankProbeMaxBytes: z.natural().default(DEFAULT_COLD_BLANK_PROBE_MAX_BYTES),
-    historyPageMaxEvents: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER)
-      .default(DEFAULT_HISTORY_PAGE_MAX_EVENTS),
     nativeOpen: z.boolean(),
+    historyPageMaxEvents: z.number().step(1).min(1).max(Number.MAX_SAFE_INTEGER).default(DEFAULT_HISTORY_PAGE_MAX_EVENTS),
   })
 
   private readonly agents: ApiSessionAgentController
@@ -109,25 +108,31 @@ export class SessionController extends TypertRemoteService {
   private readonly listState: ApiSessionList
   private readonly openPath: (path: string, signal: AbortSignal) => Promise<void>
   private readonly canOpenPath: () => boolean
+  private readonly promotions = new Set<Promise<void>>()
 
   /**
    * @param ctx - Host context containing the Session capability assembly.
-   * @param config - cold-list observation policy.
+   * @param config - native-opener and history-window deployment policy.
+   * @param internals - host integrations replaceable by direct unit tests.
    */
   constructor(ctx: Context, config: Config, internals: SessionControllerInternals = {}) {
     super(ctx, 'sessionController', { namespace: 'session' })
     installModelSelectionProjection(ctx)
     this.agents = new ApiSessionAgentController(ctx)
     this.commands = new SessionCommandController(ctx, this.agents, process.cwd())
+    ctx.effect(() => ctx.fileUploads.registerAgentResolver(async (sessionId) => {
+      const result = await this.agents.resolveAgent(sessionId)
+      if ('error' in result) throw result.error
+      return result.agent
+    }), 'session-controller: file-upload Agent resolver')
     this.controlState = new SessionControlController(ctx)
-    this.history = new SessionHistoryController(
-      ctx,
-      config.historyPageMaxEvents ?? DEFAULT_HISTORY_PAGE_MAX_EVENTS,
-    )
-    this.listState = new ApiSessionList(
-      ctx,
-      config.coldBlankProbeMaxBytes ?? DEFAULT_COLD_BLANK_PROBE_MAX_BYTES,
-    )
+    // Registered before history so reverse-order teardown closes every
+    // follower before waiting for already-admitted promotions.
+    ctx.effect(() => async () => {
+      await Promise.allSettled([...this.promotions])
+    }, 'session-controller.promotions')
+    this.history = new SessionHistoryController(ctx, (observation) => { this.promote(observation) }, config.historyPageMaxEvents)
+    this.listState = new ApiSessionList(ctx)
     this.openPath = internals.openPath ?? openNativePath
     this.canOpenPath = internals.canOpenPath
       ?? (() => config.nativeOpen ?? (internals.openPath !== undefined || canOpenNativePath()))
@@ -159,6 +164,19 @@ export class SessionController extends TypertRemoteService {
       if (event.type !== 'user/message' || event.data.source.kind !== 'user') return
       ctx.emit('api-session/activity', session.id, event.time)
     })
+  }
+
+  private promote(observation: SessionObservation): void {
+    const sessionId = observation.header.id
+    const task = (async () => {
+      using ownedObservation = observation
+      const result = await this.agents.resolveObservedAgent(ownedObservation)
+      if ('error' in result) this.ctx.emit('api-session/error', sessionId, result.error.message)
+    })().catch((error: unknown) => {
+      this.ctx.logger.error(`session-controller: background activation for "${sessionId}" failed: ${errorChain(error)}`)
+    })
+    this.promotions.add(task)
+    void task.finally(() => { this.promotions.delete(task) })
   }
 
   /**
@@ -361,7 +379,8 @@ export class SessionController extends TypertRemoteService {
    * Follow one Session log from its opening or resume cursor.
    * @param request - durable address and last committed sequence already held by the caller.
    * @param signal - cancellation owned by the Remote stream carrier.
-   * @returns a complete opening snapshot followed by gap-free event frames.
+   * @returns a complete opening snapshot followed by gap-free durable event
+   *   frames and optional cursorless assistant-stream frames.
    */
   @Remote({ mode: 'stream' })
   follow(request: SessionFollowRequest, signal: AbortSignal): AsyncIterable<SessionFollowFrame> {
