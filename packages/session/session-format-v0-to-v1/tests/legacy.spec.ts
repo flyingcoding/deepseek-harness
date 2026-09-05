@@ -18,6 +18,26 @@ function migrate(rows: readonly unknown[]) {
 }
 
 describe('released v0 legacy normalization', () => {
+  it.each([
+    { api: '' },
+    { blocks: 'invalid' },
+    { unsupported: true },
+  ])('refuses malformed flat pi-ai replay state %j', (override) => {
+    const replayState = {
+      kind: 'pi-ai', version: 1, api: 'openai-completions', provider: 'mock', model: 'mock',
+      stopReason: 'stop', blocks: [], ...override,
+    }
+    expect(() => migrate([
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
+      { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
+      { type: 'assistant/chunk', seq: 2, time: 3, data: { turn: 1, step: 1, chunk: {
+        type: 'finish', reason: { kind: 'stop' }, replayState,
+      } } },
+      { type: 'step/end', seq: 3, time: 4, data: { turn: 1, step: 1 } },
+      { type: 'turn/end', seq: 4, time: 5, data: { turn: 1, reason: { kind: 'completed' } } },
+    ])).toThrow(/legacy pi-ai replay state/)
+  })
+
   it('restores pre-identity user, assistant, and replacement tool-result identities', () => {
     const rows = [
       { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },

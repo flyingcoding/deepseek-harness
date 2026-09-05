@@ -42,6 +42,8 @@ Alpha 迁移边会拒绝冻结清单之外的所有事件类型，包括带有 `
 
 有限的历史规范化会把 `steering/message` 转换为 `user/message`、移除 `turn/start.trigger`、转换已停用的 `turn/end` reason、添加当前消息包装层与确定性的旧消息 id，并移除已停用且重复的 `request/header.header.messagePrefix`。已停用的 `request/header-delta`、`mode/set` 和 `request/header` fallback reason 会使迁移失败。除此之外，任何事件、引用、来源或 payload 事实都不得改变。
 
+已知的扁平 pi-ai version-1 回放状态完整保留在 replay envelope 的不透明 `response` 部分，同时作用于 finish chunk 和对应 assistant message。其私有版本保持不变，仍由 adapter 现有的提供方中立回退规则处理。
+
 -----
 
 <a id="understand-the-implementation"></a>

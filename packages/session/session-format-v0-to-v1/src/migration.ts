@@ -2,6 +2,7 @@ import {
   SessionFormatError,
   SessionFormatUnsupportedMigrationError,
   defineSessionFormatMigration,
+  isSessionFormatJsonObject,
   sessionFormatCount,
   snapshotSessionFormatArtifact,
 } from '@deepseek-ai/dsh-session-format'
@@ -61,13 +62,49 @@ function normalizeReleasedV0Events(
     const end = normalizeLegacyTurnEnd(start, sessionId)
     const header = normalizeLegacyRequestHeader(end, sessionId)
     const steering = normalizeLegacySteering(header, sessionId)
-    const message = normalizeLegacyMessage(steering, sessionId, messageIds)
+    const message = normalizeLegacyReplay(normalizeLegacyMessage(steering, sessionId, messageIds))
     assertReleasedEventPayload(message, 0)
     output.push(message)
     const messageId = eventMessageId(message)
     if (messageId !== undefined) messageIds.set(message.seq, messageId)
   }
   return Object.freeze(output)
+}
+
+/** Preserve the flat pi-ai v1 metadata inside the current opaque response envelope. */
+function normalizeLegacyReplay(event: SessionFormatEvent): SessionFormatEvent {
+  if (event.type !== 'assistant/chunk' && event.type !== 'assistant/message') return event
+  const data = releasedV0Record(event.data, `${event.type} ${event.seq} data`)
+  if (event.type === 'assistant/chunk') {
+    const chunk = releasedV0Record(data['chunk'], `assistant/chunk ${event.seq} chunk`)
+    if (chunk['type'] !== 'finish') return event
+    const replayState = legacyReplayEnvelope(chunk['replayState'])
+    return replayState === undefined
+      ? event
+      : { ...event, data: { ...data, chunk: { ...chunk, replayState } } }
+  }
+  const message = releasedV0Record(data['message'], `assistant/message ${event.seq} message`)
+  const source = releasedV0Record(message['source'], `assistant/message ${event.seq} source`)
+  const replayState = legacyReplayEnvelope(source['replayState'])
+  return replayState === undefined
+    ? event
+    : { ...event, data: { ...data, message: { ...message, source: { ...source, replayState } } } }
+}
+
+/** Recognize only the observed flat pi-ai generation; retain its private version and every field. */
+function legacyReplayEnvelope(value: SessionFormatJsonValue | undefined): SessionFormatJsonObject | undefined {
+  if (!isSessionFormatJsonObject(value)
+    || value['kind'] !== 'pi-ai' || value['version'] !== 1) return undefined
+  const replay = releasedV0Record(value, 'legacy pi-ai replay state')
+  assertReleasedV0Keys(replay, ['kind', 'version', 'api', 'provider', 'model', 'stopReason', 'blocks'],
+    ['responseId', 'responseModel'], 'legacy pi-ai replay state')
+  for (const key of ['api', 'provider', 'model', 'stopReason']) {
+    if (typeof replay[key] !== 'string' || replay[key].length === 0) {
+      throw new SessionFormatError(`legacy pi-ai replay state ${key} must be a non-empty string`)
+    }
+  }
+  if (!Array.isArray(replay['blocks'])) throw new SessionFormatError('legacy pi-ai replay state blocks must be an array')
+  return { response: replay }
 }
 
 function normalizeLegacyRequestHeader(event: SessionFormatEvent, sessionId: string): SessionFormatEvent {

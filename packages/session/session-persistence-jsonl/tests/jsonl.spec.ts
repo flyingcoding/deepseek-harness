@@ -271,6 +271,33 @@ describe('bounded cold history', () => {
     expect(scanLogWindow(torn, undefined, 1).events).toEqual(events.slice(-1))
   })
 
+  it('preserves flat pi-ai replay metadata while migrating a released v0 log', async () => {
+    const dir = await freshRoot()
+    const ctx = new Context()
+    try {
+      await ctx.plugin(JsonlSessionPersistence, { root: dir, compression: 'none' })
+      const header = meta('flat-pi-replay', '/work')
+      const replayState = {
+        kind: 'pi-ai', version: 1, api: 'openai-completions', provider: 'mock', model: 'mock',
+        stopReason: 'stop', responseId: 'old-response', blocks: [{ type: 'text', textSignature: 'old-signature' }],
+      }
+      const rows = releasedV1OneTurnLog().map(event => ({ ...event, data: structuredClone(event.data) as Record<string, unknown> }))
+      ;((rows[6] as (typeof rows)[number]).data['chunk'] as Record<string, unknown>)['replayState'] = replayState
+      const message = (rows[7] as (typeof rows)[number]).data['message'] as Record<string, unknown>
+      ;(message['source'] as Record<string, unknown>)['replayState'] = replayState
+      const source = `${[releasedV0Header(header), ...rows].map(row => JSON.stringify(row)).join('\n')}\n`
+      const path = historicalLogPath(dir, header.cwd, header.id)
+      await mkdir(dirname(path), { recursive: true })
+      await writeFile(path, source)
+      const result = await ctx.sessionPersistence.readWindow(header.id, undefined, 10)
+      const assistant = result.events.find(event => event.type === 'assistant/message')
+      expect(assistant?.data.message.source).toMatchObject({ replayState: { response: replayState } })
+      expect(await readFile(path, 'utf8')).toBe(source)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('handles empty pending sessions and rejects invalid or cancelled window requests', async () => {
     const dir = await freshRoot()
     const ctx = new Context()

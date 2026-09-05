@@ -42,6 +42,8 @@ The alpha edge refuses every event type outside its frozen inventory, including 
 
 The bounded historical normalizers convert `steering/message` to `user/message`, remove `turn/start.trigger`, convert retired `turn/end` reasons, add the current message wrappers and deterministic legacy message ids, and remove the obsolete `request/header.header.messagePrefix` duplicate. Retired `request/header-delta`, `mode/set`, and the `request/header` fallback reason refuse migration. No other event, reference, source, or payload fact may change.
 
+Known flat pi-ai version-1 replay state is retained intact inside the opaque `response` half of a replay envelope on both the finish chunk and its assistant message. Its private version is preserved, so the adapter's existing provider-neutral fallback remains authoritative.
+
 -----
 
 <a id="understand-the-implementation"></a>
