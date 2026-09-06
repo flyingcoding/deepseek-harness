@@ -98,6 +98,18 @@ export interface SessionPersistenceWindow extends SessionStorageMetadata {
   readonly hasMore: boolean
 }
 
+/**
+ * Select a visitor for the complete validated prefix that produced a window.
+ * The visitor receives every event from seq 0, including events outside the
+ * retained window, in sequence order. Callers publish derived state only after
+ * `readWindow` succeeds; returning undefined skips the additional traversal.
+ * @param window - the exact window and lineage metadata for this read.
+ * @returns a synchronous event visitor, or undefined when no fold is needed.
+ */
+export type SessionPersistenceWindowVisitor = (
+  window: SessionPersistenceWindow,
+) => ((event: SessionEvent) => void) | undefined
+
 /** Options for {@link SessionPersistence.open}. */
 export interface SessionPersistenceOpenOptions {
   /** Optional cancellation observed before backend work starts. */
@@ -179,6 +191,7 @@ export abstract class SessionPersistence extends Service {
    * @param beforeSeq - exclusive upper offset; omitted selects the tail.
    * @param maxEvents - positive safe-integer event ceiling.
    * @param signal - optional cancellation for the read.
+   * @param visit - optional complete-prefix visitor selected from the validated window.
    * @returns the bounded events, complete stored cursor, and storage metadata.
    */
   async readWindow(
@@ -186,6 +199,7 @@ export abstract class SessionPersistence extends Service {
     beforeSeq: SessionLogOffset | undefined,
     maxEvents: number,
     signal?: AbortSignal,
+    visit?: SessionPersistenceWindowVisitor,
   ): Promise<SessionPersistenceWindow> {
     if (beforeSeq !== undefined) SessionLogOffset(beforeSeq)
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1) {
@@ -197,13 +211,21 @@ export abstract class SessionPersistence extends Service {
     signal?.throwIfAborted()
     const end = Math.min(events.length, beforeSeq ?? events.length)
     const start = Math.max(0, end - maxEvents)
-    return {
+    const window: SessionPersistenceWindow = {
       meta: handle.header,
       inheritedEventCount: handle.inheritedEventCount,
       events: events.slice(start, end),
       cursor: events.at(-1)?.seq ?? -1,
       hasMore: start > 0,
     }
+    const onEvent = visit?.(window)
+    if (onEvent !== undefined) {
+      for (const event of events) {
+        signal?.throwIfAborted()
+        onEvent(event)
+      }
+    }
+    return window
   }
 
   /**

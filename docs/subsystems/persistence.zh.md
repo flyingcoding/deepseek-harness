@@ -4,11 +4,11 @@
 
 事件日志的**持久性 seam**。[session.md](session.zh.md) 描述了内存中的 `Session`：仅追加的 `SessionEvent` 日志即为真源。本页描述如何使该日志持久化：抽象的 `SessionPersistence` 服务、它的提供方模型与随产品交付的 JSONL 后端、flush 检查点、崩溃恢复，以及随日志一同存储的元数据头。日志承载的事件词汇在生成的[持久化日志事件目录](../persistence-catalog.zh.md)中逐项列举。
 
-该 seam 是一个[能力 seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.zh.md)：一个抽象服务（[dsh-session-persistence](../../packages/session/session-persistence)，`ctx.sessionPersistence`）在现有 `SessionEvent` 上暴露 `create`/`open`/`stat`/`list`——**没有平行的持久化事件类型**——其中 `create` 与 `open` 返回逐会话的 `SessionHandle`（`read`/`append`/`flush`/`close`），它承载全部日志访问与单写者所有权。仓库随产品交付 [dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl) 作为其 provider；仓库外 provider 可以实现同一服务约定。见[基于句柄的持久化 Agent Note](../../.agents/notes/implemented/architecture/2026-08-27-handle-based-session-persistence.zh.md)与 [session-persistence Agent Note](../../.agents/notes/implemented/architecture/2026-06-14-session-persistence.zh.md)。
+该 seam 是一个[能力 seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.zh.md)：一个抽象服务（[dsh-session-persistence](../../packages/session/session-persistence)，`ctx.sessionPersistence`）在现有 `SessionEvent` 上暴露 `create`/`open`/`stat`/`list`/`readWindow`——**没有平行的持久化事件类型**——其中 `create` 与 `open` 返回逐会话的 `SessionHandle`（`read`/`append`/`flush`/`close`），它承载可变日志访问与单写者所有权。仓库随产品交付 [dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl) 作为其 provider；仓库外 provider 可以实现同一服务约定。见[基于句柄的持久化 Agent Note](../../.agents/notes/implemented/architecture/2026-08-27-handle-based-session-persistence.zh.md)与 [session-persistence Agent Note](../../.agents/notes/implemented/architecture/2026-06-14-session-persistence.zh.md)。
 
 ## `SessionHandle`——通向已存储会话的一条打开通道
 
-每一次日志读写都经由句柄流动，绝不经由按 id 寻址的服务方法：句柄是跨进程写租约把守的那扇唯一的门。一种句柄类型同时服务两种访问——在 `read` 句柄上执行修改是运行时的 `SessionReadOnlyError`，而非类型层面的拆分——而进程内单写者所有权使得在已有活跃持有者时第二次 `open(id, 'write')` 以 `SessionAlreadyOwnedError` 拒绝。
+日志修改和普通范围读取经由句柄。独立的 `readWindow` 服务方法执行不取得写所有权的观察。一种句柄类型同时服务两种访问——在 `read` 句柄上执行修改是运行时的 `SessionReadOnlyError`，而非类型层面的拆分——而进程内单写者所有权使得在已有活跃持有者时第二次 `open(id, 'write')` 以 `SessionAlreadyOwnedError` 拒绝。
 
 ```ts type-equiv
 /**
@@ -87,6 +87,36 @@ interface SessionHandle extends AsyncDisposable {
 ```
 
 已创建的会话自 `create` 完成之刻起即可在本进程内被观察到，而后端可以把物理实体化（纯粹的优化）推迟到第一次 `append` 或 `flush`；其他进程只能看到已实体化的会话，一个在崩溃前从未实体化的会话等于从未存在。
+
+## 有界历史窗口
+
+通过 `readWindow` 取得向后切片，同时从完整存储前缀派生状态。[有界回放决策](../../.agents/notes/implemented/bug-fix/2026-09-06-bounded-history-projection-replay.zh.md)说明事件保留和精确 fork 初始化。
+
+```ts type-equiv
+/** A bounded contiguous window from one validated stored Session prefix. */
+interface SessionPersistenceWindow extends SessionStorageMetadata {
+  /** Logical events ending before the requested offset. */
+  readonly events: readonly SessionEvent[]
+  /** Last sequence in the complete stored prefix, or -1 when empty. */
+  readonly cursor: SessionSeqCursor
+  /** Whether stored events precede this window. */
+  readonly hasMore: boolean
+}
+```
+
+```ts type-equiv
+/**
+ * Select a visitor for the complete validated prefix that produced a window.
+ * The visitor receives every event from seq 0, including events outside the
+ * retained window, in sequence order. Callers publish derived state only after
+ * `readWindow` succeeds; returning undefined skips the additional traversal.
+ * @param window - the exact window and lineage metadata for this read.
+ * @returns a synchronous event visitor, or undefined when no fold is needed.
+ */
+type SessionPersistenceWindowVisitor = (
+  window: SessionPersistenceWindow,
+) => ((event: SessionEvent) => void) | undefined
+```
 
 ## flush 检查点
 
@@ -360,9 +390,10 @@ abstract open(id: SessionId, access: SessionAccess, options?: SessionPersistence
  * @param beforeSeq - exclusive upper offset; omitted selects the tail.
  * @param maxEvents - positive safe-integer event ceiling.
  * @param signal - optional cancellation for the read.
+ * @param visit - optional complete-prefix visitor selected from the validated window.
  * @returns the bounded events, complete stored cursor, and storage metadata.
  */
-async readWindow( id: SessionId, beforeSeq: SessionLogOffset | undefined, maxEvents: number, signal?: AbortSignal, ): Promise<SessionPersistenceWindow>
+async readWindow( id: SessionId, beforeSeq: SessionLogOffset | undefined, maxEvents: number, signal?: AbortSignal, visit?: SessionPersistenceWindowVisitor, ): Promise<SessionPersistenceWindow>
 
 /**
  * Flush every active write handle owned by this service instance in one

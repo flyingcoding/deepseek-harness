@@ -16,6 +16,8 @@ import type {
   SessionSeqCursor,
 } from '@deepseek-ai/dsh-session'
 import { SessionQueryError, type SessionObservation } from '@deepseek-ai/dsh-session-query'
+import type { SessionPersistenceWindow } from '@deepseek-ai/dsh-session-persistence'
+import type { ProjectionSnapshot } from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
@@ -293,14 +295,22 @@ export class SessionHistoryController {
     const persistence = this.ctx.get('sessionPersistence')
     if (persistence === undefined) return undefined
     try {
-      const window = await persistence.readWindow(sessionId, beforeSeq, this.maxPageEvents, signal)
+      let projectionReader: WindowProjectionReader | undefined
+      const registry = this.ctx.get('sessionProjections')
+      const window = await persistence.readWindow(sessionId, beforeSeq, this.maxPageEvents, signal, (window) => {
+        if (registry === undefined || !(withProjections || address.kind === 'subagent')) return undefined
+        if (withProjections && !window.hasMore) return undefined
+        const reader = createWindowProjectionReader(registry, window, this.maxPageEvents)
+        projectionReader = reader
+        return (event) => { reader.accept(event) }
+      })
       signal.throwIfAborted()
       if (this.ctx.sessions.get(sessionId) !== undefined) return undefined
       if (withProjections && !window.hasMore) return undefined
       if (beforeSeq === undefined && window.cursor >= 0 && window.events.at(-1)?.type !== 'turn/end') return undefined
-      const projections = withProjections || address.kind === 'subagent'
+      const projections = projectionReader?.snapshot() ?? (withProjections || address.kind === 'subagent'
         ? this.ctx.get('sessionProjectionCache')?.cachedSnapshot(window.meta, window.inheritedEventCount)
-        : undefined
+        : undefined)
       if (window.meta.cwd === undefined) rejectNotFound(address)
       if (address.kind === 'subagent' && projections === undefined) return undefined
       validateAddress(address, window.meta, window.inheritedEventCount, projections)
@@ -363,6 +373,43 @@ export class SessionHistoryController {
     }
   }
 
+}
+
+interface WindowProjectionReader {
+  accept(event: SessionEvent): void
+  snapshot(): ProjectionSnapshot
+}
+
+/** Fold the complete stored prefix in bounded batches without constructing a Session. */
+function createWindowProjectionReader(
+  registry: Context['sessionProjections'],
+  window: SessionPersistenceWindow,
+  maxEvents: number,
+): WindowProjectionReader {
+  let restored = registry.restore({}, [], SessionLogOffset(0), window.meta, window.inheritedEventCount)
+  let pending: SessionEvent[] = []
+  /** Include the pending contiguous batch before exposing its projection cut. */
+  const snapshot = (): ProjectionSnapshot => {
+    if (pending.length > 0) {
+      restored = registry.restore(
+        restored.checkpoint,
+        pending,
+        SessionLogOffset((pending[0] as SessionEvent).seq),
+        window.meta,
+        window.inheritedEventCount,
+      )
+      pending = []
+    }
+    return restored.snapshot
+  }
+  return {
+    /** Bound retained input independently from each projection's accumulated state. */
+    accept(event) {
+      pending.push(event)
+      if (pending.length >= maxEvents) snapshot()
+    },
+    snapshot,
+  }
 }
 
 function cursorBeforeNext(nextSeq: SessionLogOffsetType): SessionSeqCursor {

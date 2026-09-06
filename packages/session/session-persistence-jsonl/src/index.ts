@@ -27,7 +27,7 @@ import {
   type SessionLocation, type SessionPersistenceCreateOptions,
   type SessionPersistenceListOptions, type SessionPersistenceOpenOptions,
   type SessionPersistenceSnapshot, type SessionPersistenceStatOptions,
-  type SessionPersistenceWindow,
+  type SessionPersistenceWindow, type SessionPersistenceWindowVisitor,
   type SessionPersistenceRevision as PersistenceRevision,
 } from '@deepseek-ai/dsh-session-persistence'
 import { JsonlBackendTracker, JsonlSessionHandle } from './storage.ts'
@@ -316,6 +316,7 @@ class JsonlSessionPersistence extends SessionPersistence {
     beforeSeq: SessionLogOffsetType | undefined,
     maxEvents: number,
     signal?: AbortSignal,
+    visit?: SessionPersistenceWindowVisitor,
   ): Promise<SessionPersistenceWindow> {
     if (beforeSeq !== undefined) SessionLogOffset(beforeSeq)
     if (!Number.isSafeInteger(maxEvents) || maxEvents < 1) {
@@ -323,7 +324,7 @@ class JsonlSessionPersistence extends SessionPersistence {
     }
     signal?.throwIfAborted()
     await this.ensureRootEncoding()
-    if (this.tracker.hasPending(id)) return super.readWindow(id, beforeSeq, maxEvents, signal)
+    if (this.tracker.hasPending(id)) return super.readWindow(id, beforeSeq, maxEvents, signal, visit)
     const selected = await this.findLog(id, signal)
     if (selected === undefined) throw new SessionPersistenceNotFoundError(id)
     let path = selected.sourcePath
@@ -351,6 +352,18 @@ class JsonlSessionPersistence extends SessionPersistence {
     }
     signal?.throwIfAborted()
     await this.assertStoredIdentity(path, SESSION_FORMAT_VERSION, window.meta, id, signal)
+    const onEvent = visit?.(window)
+    if (onEvent !== undefined) {
+      // Replay the same bytes after the first pass establishes the exact fork
+      // cut. This traversal retains one event, independent of log length.
+      const accept = (event: SessionEvent): void => {
+        signal?.throwIfAborted()
+        onEvent(event)
+      }
+      if (this.compression === 'zstd') await this.readZstdWindow(bytes, undefined, 1, signal, accept)
+      else scanLogWindow(bytes, undefined, 1, accept)
+      signal?.throwIfAborted()
+    }
     return {
       meta: window.meta,
       inheritedEventCount: window.inheritedEventCount,
@@ -713,6 +726,7 @@ class JsonlSessionPersistence extends SessionPersistence {
     beforeSeq: SessionLogOffsetType | undefined,
     maxEvents: number,
     signal?: AbortSignal,
+    onEvent?: (event: SessionEvent) => void,
   ): Promise<SessionPersistenceWindow> {
     signal?.throwIfAborted()
     const { frames, tornStart } = scanZstdFrames(buffer)
@@ -727,7 +741,7 @@ class JsonlSessionPersistence extends SessionPersistence {
       assertZstdHeaderFrame(headerFrame.value)
       const scanner = new SessionLogScanner(
         headerFrame.value,
-        { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents },
+        { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents, ...onEvent === undefined ? {} : { onEvent } },
       )
       let remainingFrames = frames.length - 1
       for (const plaintext of decodedFrames) {

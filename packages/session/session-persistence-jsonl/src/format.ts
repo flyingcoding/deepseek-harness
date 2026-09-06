@@ -371,6 +371,8 @@ export interface SessionLogWindowOptions {
   beforeSeq?: SessionLogOffsetType
   /** Positive safe-integer ceiling on retained events. */
   maxEvents: number
+  /** Receive every validated event, including rows outside the retained window. */
+  onEvent?: (event: SessionEvent) => void
 }
 
 /** Derive the v2 fork cut from the last lineage-tagged seed marker. */
@@ -565,6 +567,7 @@ export class SessionLogScanner {
         return
       }
       if (this.window !== undefined) validateStoredEvents(this.meta, [event])
+      this.window?.onEvent?.(event)
       this.nextSeq = SessionLogOffset(this.nextSeq + 1)
       if (event.type === 'session/end-seed' && event.data.inherited === true) this.inheritedMarker = event
       if (this.window === undefined || event.seq < (this.window.beforeSeq ?? Number.MAX_SAFE_INTEGER)) {
@@ -601,18 +604,20 @@ export function scanLog(buffer: Buffer): SessionLogScan {
  * @param buffer - complete or torn JSONL bytes.
  * @param beforeSeq - exclusive upper offset; omitted selects the tail.
  * @param maxEvents - positive event retention ceiling.
+ * @param onEvent - optional visitor for the complete validated event prefix.
  * @returns bounded events and complete-prefix metadata.
  */
 export function scanLogWindow(
   buffer: Buffer,
   beforeSeq: SessionLogOffsetType | undefined,
   maxEvents: number,
+  onEvent?: (event: SessionEvent) => void,
 ): SessionLogWindowScan {
   const headerEnd = buffer.indexOf(0x0A)
   if (headerEnd === -1) throw new Error('empty or header-less session log')
   const scanner = new SessionLogScanner(
     buffer.subarray(0, headerEnd + 1),
-    { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents },
+    { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents, ...onEvent === undefined ? {} : { onEvent } },
   )
   scanner.write(buffer.subarray(headerEnd + 1))
   return scanner.finishWindow()

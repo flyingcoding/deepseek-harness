@@ -76,7 +76,7 @@ kind: "package-reference"
 
 ### 读取日志
 
-`readWindow(id, beforeSeq, maxEvents)` 校验每个完整记录，只保留所请求的向后窗口；它不打开完整日志句柄，也不填充解析日志 memo。逻辑事件数上限不限制压缩输入字节数或单个事件的内容大小。读取受支持的历史 generation 时，仍先完成全量格式迁移，再执行当前 generation 的有界读取。
+`readWindow(id, beforeSeq, maxEvents)` 校验每个完整记录，只保留所请求的向后窗口；它不打开完整日志句柄，也不填充解析日志 memo。请求完整前缀 visitor 时，在精确 fork cut 已知后再次遍历同一份输入字节，仅额外保留一个事件。逻辑事件数上限不限制压缩输入字节数、单个事件的内容大小或调用方持有的投影状态。读取受支持的历史 generation 时，仍先完成全量格式迁移，再执行当前 generation 的有界读取。
 
 `open(id, 'read'|'write')` 选择最高规范 generation，并在返回句柄前为受支持的历史源发布一个并列的当前后继；源保持逐字节不变。句柄的 `read(offset?, length?)` 随后提供经过验证的连续切片，绝不包含撕裂尾部。撕裂的最终 Zstandard 帧会被部分解码：其中已刷入的完整 JSONL 记录被恢复进逻辑日志，写句柄的第一次修改会截掉当前 generation 的撕裂字节并在自己的批次之前持久重写这些恢复的记录。写 open 会用已验证的存储前缀预热句柄，一个按 revision 为键的有界 memo 让紧接的观察到恢复交接复用该解析。`stat(id)` 与 `list()` 只选择并转换最高 generation 的 header，不读取事件行，也不发布迁移输出；快照携带所选文件的 `sizeBytes` 与尽力而为的 stat 派生修订号。选择 `compression: 'none'` 后，日志是外部读取方可直接消费的换行分隔文本；压缩默认值必须经后端读取。
 

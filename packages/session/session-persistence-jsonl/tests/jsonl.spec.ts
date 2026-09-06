@@ -234,6 +234,61 @@ describe('bounded cold history', () => {
     }
   })
 
+  it.each(['none', 'zstd'] as const)('visits one exact full prefix while returning an earlier bounded window (%s)', async (compression) => {
+    const dir = await freshRoot()
+    const ctx = new Context()
+    try {
+      await ctx.plugin(JsonlSessionPersistence, { root: dir, compression })
+      const header = { ...meta('window-visitor', '/work'), isSeeded: true }
+      const events: SessionEvent[] = [
+        ...oneTurnLog(),
+        { type: 'session/end-seed', seq: SessionSeq(6), time: 7, data: { inherited: true } },
+      ]
+      await using writer = await ctx.sessionPersistence.create(header, { inheritedEventCount: SessionLogOffset(6) })
+      await writer.append(events)
+      await writer.close()
+      const open = vi.spyOn(ctx.sessionPersistence, 'open')
+      const observed: SessionEvent[] = []
+      const result = await ctx.sessionPersistence.readWindow(header.id, SessionLogOffset(3), 1, undefined, (window) => {
+        expect(window).toMatchObject({ meta: header, inheritedEventCount: 6, cursor: 6 })
+        return (event) => { observed.push(event) }
+      })
+      expect(result.events).toEqual(events.slice(2, 3))
+      expect(observed).toEqual(events)
+      expect(open).not.toHaveBeenCalled()
+      const baseObserved: SessionEvent[] = []
+      await SessionPersistence.prototype.readWindow.call(ctx.sessionPersistence, header.id, SessionLogOffset(3), 1, undefined,
+        () => (event) => { baseObserved.push(event) })
+      expect(baseObserved).toEqual(events)
+      const failure = new Error('projection rejected')
+      await expect(ctx.sessionPersistence.readWindow(header.id, undefined, 1, undefined,
+        () => () => { throw failure })).rejects.toBe(failure)
+      const abort = new AbortController()
+      await expect(ctx.sessionPersistence.readWindow(header.id, undefined, 1, abort.signal,
+        () => () => { abort.abort() })).rejects.toMatchObject({ name: 'AbortError' })
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('does not select a visitor for an invalid committed prefix', async () => {
+    const dir = await freshRoot()
+    const ctx = new Context()
+    try {
+      await ctx.plugin(JsonlSessionPersistence, { root: dir, compression: 'none' })
+      const header = meta('corrupt-window-visitor', '/work')
+      await writeLog(ctx.sessionPersistence, header, oneTurnLog())
+      const path = rawLogPath(dir, header.cwd, header.id)
+      await writeFile(path, (await readFile(path, 'utf8')).replace('"type":"turn/start"', '"type":"future/required"'))
+      const visit = vi.fn()
+      await expect(ctx.sessionPersistence.readWindow(header.id, undefined, 1, undefined, visit))
+        .rejects.toMatchObject({ name: 'SessionFormatUnsupportedError' })
+      expect(visit).not.toHaveBeenCalled()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('migrates a released generation for a window without changing its source bytes', async () => {
     const dir = await freshRoot()
     const ctx = new Context()

@@ -3,10 +3,12 @@ import { createScope } from '@deepseek-ai/dsh-scope'
 import SessionStore, { SESSION_FORMAT_VERSION, SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SurfaceIntent } from '@deepseek-ai/dsh-session'
 import type { SessionObservation } from '@deepseek-ai/dsh-session-query'
+import type { SessionPersistenceWindowVisitor } from '@deepseek-ai/dsh-session-persistence'
 import { snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
 import { subagentIdentityProjectionDefinition } from '@deepseek-ai/dsh-subagent/src/projection.ts'
 import { describe, expect, it, vi } from 'vitest'
 import { SessionHistoryController } from '../src/history.ts'
+import { installModelSelectionProjection } from '../src/model-selection-projection.ts'
 import { installSessionReadTestServices, testSessionPersistence } from './test-remote.ts'
 
 const signal = (): AbortSignal => new AbortController().signal
@@ -82,24 +84,43 @@ async function setup(): Promise<{ ctx: Context; transport: SessionHistoryControl
 }
 
 describe('SessionHistoryController', () => {
-  it('opens a bounded cold tail without materializing or promoting its full Session', async () => {
+  it.each(['missing', 'stale'] as const)('opens a bounded cold tail with complete projections and a %s cache without promoting its Session', async (cache) => {
     const { ctx } = await setup()
+    installModelSelectionProjection(ctx)
     const abort = new AbortController()
     try {
       const header: SessionHeader = {
         id: SessionId('bounded-cold'), version: SESSION_FORMAT_VERSION, isSeeded: false, createdAt: 1, cwd: '/work',
       }
       const events = [
-        event('turn/start', SessionSeq(0), { turn: 1 }),
-        ...Array.from({ length: 4 }, (_, index) => event('fixture/entry', SessionSeq(index + 1))),
+        event('model/selection', SessionSeq(0), { provider: 'commandcode', model: 'recorded-model' }),
+        event('turn/start', SessionSeq(1), { turn: 1 }),
+        ...Array.from({ length: 3 }, (_, index) => event('fixture/entry', SessionSeq(index + 2))),
         event('turn/end', SessionSeq(5), { turn: 1, reason: { kind: 'completed' } }),
       ]
+      if (cache === 'stale') {
+        ctx.provide('sessionProjectionCache', {
+          cachedSnapshot: () => ({ asOfSeq: -1, values: { modelSelection: { lastUsed: null, next: null } } }),
+        } as never)
+      }
       const observe = vi.spyOn(ctx.sessionQuery, 'observeSession')
       ctx.provide('sessionPersistence', {
-        readWindow: async (_id: SessionId, before: SessionLogOffset | undefined, maxEvents: number) => {
+        readWindow: async (
+          _id: SessionId,
+          before: SessionLogOffset | undefined,
+          maxEvents: number,
+          _signal?: AbortSignal,
+          visit?: SessionPersistenceWindowVisitor,
+        ) => {
           const end = before ?? events.length
           const start = Math.max(0, end - maxEvents)
-          return { meta: header, inheritedEventCount: SessionLogOffset(0), events: events.slice(start, end), cursor: 5, hasMore: start > 0 }
+          const window = {
+            meta: header, inheritedEventCount: SessionLogOffset(0),
+            events: events.slice(start, end), cursor: SessionSeq(5), hasMore: start > 0,
+          }
+          const accept = visit?.(window)
+          for (const event of events) accept?.(event)
+          return window
         },
       } as never)
       const promote = vi.fn()
@@ -110,7 +131,9 @@ describe('SessionHistoryController', () => {
         expect(await iterator.next()).toMatchObject({ value: {
           type: 'snapshot', cursor: 5, hasMore: true,
           records: events.slice(3).map(event => ({ type: 'event', event })),
-          projections: { asOfSeq: -1, values: {} }, assistantStream: { revision: 0 },
+          projections: { asOfSeq: 5, values: { modelSelection: {
+            lastUsed: null, next: { provider: 'commandcode', model: 'recorded-model' },
+          } } }, assistantStream: { revision: 0 },
         } })
         expect(await transport.page({ address, throughSeq: 5, beforeSeq: 3 }, abort.signal))
           .toEqual({ records: events.slice(0, 3).map(event => ({ type: 'event', event })), hasMore: false })

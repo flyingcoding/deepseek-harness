@@ -33,6 +33,7 @@ import { expandOwningTurnProcess, newEnglishPage, saveFailureShot } from './supp
 const SNAPSHOT_DIR = fileURLToPath(new URL('../../../snapshots/web/seeded-history', import.meta.url))
 const SEED = fileURLToPath(new URL('../../../snapshots/web/seeded-history/session.v2.jsonl', import.meta.url))
 const UI_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/seeded-history/ui.expected.md', import.meta.url))
+const BOUNDED_UI_EXPECTED = fileURLToPath(new URL('../../../snapshots/web/seeded-history/bounded-ui.expected.md', import.meta.url))
 const UI_EXPANDED_EXPECTED = fileURLToPath(
   new URL('../../../snapshots/web/seeded-history/ui-expanded.expected.md', import.meta.url),
 )
@@ -65,6 +66,9 @@ it.skipIf(MODE === 'record')('pages recorded cold history within an event budget
     await page.locator('[role="treeitem"]').first().click()
     await page.locator('[role="treeitem"]').nth(1).click()
     await page.getByText('DONE', { exact: true }).waitFor({ timeout: 15_000 })
+    await page.getByRole('button', { name: /^Select model, current/ }).waitFor({ timeout: 15_000 })
+    await compareOrRefreshGolden(BOUNDED_UI_EXPECTED,
+      await captureStableAria(page, '[class*="centerCol"]', scaffold.workspaceCwd), MODE)
     expect(scaffold.ctx.agents.get(sessionId) === undefined, 'opening has no active Agent').toBe(true)
     expect(scaffold.ctx.sessions.get(sessionId) === undefined, 'opening has no attached Session').toBe(true)
     const earlier = page.getByRole('button', { name: 'Load earlier' })
@@ -599,6 +603,7 @@ describe('web e2e: seeded history renders through cold resume', () => {
     expect(tripwire.pageErrors).toEqual([])
     expect(tripwire.warnings).toEqual([])
     await assertFixtureInventory(SNAPSHOT_DIR, [
+      'bounded-ui.expected.md',
       'command-row.expected.md', 'feedback-row.expected.md', 'file-open-failure.expected.md',
       'session.v2.jsonl', 'ui.expected.md', 'ui-expanded.expected.md',
     ])

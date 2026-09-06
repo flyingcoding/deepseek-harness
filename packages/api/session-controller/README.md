@@ -36,7 +36,7 @@ The Session object also carries local submission echoes: `session.beginSubmissio
 <a id="configuration"></a>
 ## Configuration
 
-Completed cold logs larger than `historyPageMaxEvents` open through bounded persistence windows without preparing or promoting the full Session. Their opening uses an existing projection cache when available. Smaller or interrupted logs retain the ordinary prepared-observation path.
+Completed cold logs larger than `historyPageMaxEvents` open through bounded persistence windows without preparing or promoting the full Session. Their opening rebuilds every registered projection from the same complete stored prefix in batches bounded by the page event limit, so model selection and turn navigation remain available when a projection cache is absent or stale. Smaller or interrupted logs retain the ordinary prepared-observation path.
 
 | Field | Default | Meaning |
 |---|---:|---|

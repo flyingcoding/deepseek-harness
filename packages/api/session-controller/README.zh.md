@@ -36,7 +36,7 @@ Session 对象还承载本地提交回显：`session.beginSubmission` 在调用�
 <a id="configuration"></a>
 ## 配置
 
-已完成且超过 `historyPageMaxEvents` 的冷日志通过持久化有界窗口打开，不准备或激活完整 Session；首帧在可用时使用已有投影缓存。较小或中断的日志保留普通的 prepared observation 路径。
+已完成且超过 `historyPageMaxEvents` 的冷日志通过持久化有界窗口打开，不准备或激活完整 Session。首帧按页面事件上限分批读取同一完整存储前缀，重建所有已注册投影，使投影缓存缺失或过期时仍能使用模型选择与轮次导航。较小或中断的日志保留普通的 prepared observation 路径。
 
 | 字段 | 默认值 | 含义 |
 |---|---:|---|

@@ -1577,9 +1577,9 @@ export const SERVICE_API: readonly ServiceApiEntry[] = [
         throws: ['{SessionPersistenceNotFoundError} when the session does not exist.', '{SessionAlreadyOwnedError} for `write` when ownership is taken.'],
       },
       {
-        signature: 'async readWindow( id: SessionId, beforeSeq: SessionLogOffset | undefined, maxEvents: number, signal?: AbortSignal, ): Promise<SessionPersistenceWindow>',
+        signature: 'async readWindow( id: SessionId, beforeSeq: SessionLogOffset | undefined, maxEvents: number, signal?: AbortSignal, visit?: SessionPersistenceWindowVisitor, ): Promise<SessionPersistenceWindow>',
         description: 'Read a backwards window without taking write ownership. The default implementation reads through a short-lived handle; sequential backends override it to validate the log while retaining only the requested window.',
-        parameters: [{ name: 'id', description: 'the stored session to read.' }, { name: 'beforeSeq', description: 'exclusive upper offset; omitted selects the tail.' }, { name: 'maxEvents', description: 'positive safe-integer event ceiling.' }, { name: 'signal', description: 'optional cancellation for the read.' }],
+        parameters: [{ name: 'id', description: 'the stored session to read.' }, { name: 'beforeSeq', description: 'exclusive upper offset; omitted selects the tail.' }, { name: 'maxEvents', description: 'positive safe-integer event ceiling.' }, { name: 'signal', description: 'optional cancellation for the read.' }, { name: 'visit', description: 'optional complete-prefix visitor selected from the validated window.' }],
         returns: 'the bounded events, complete stored cursor, and storage metadata.',
       },
       {
@@ -5194,6 +5194,10 @@ export const TYPE_API: readonly TypeApiEntry[] = [
   {
     name: 'SessionPersistenceWindow',
     declaration: 'export interface SessionPersistenceWindow extends SessionStorageMetadata {\n    readonly events: readonly SessionEvent[];\n    readonly cursor: SessionSeqCursor;\n    readonly hasMore: boolean;\n}',
+  },
+  {
+    name: 'SessionPersistenceWindowVisitor',
+    declaration: 'export type SessionPersistenceWindowVisitor = (window: SessionPersistenceWindow) => ((event: SessionEvent) => void) | undefined;',
   },
   {
     name: 'SessionProjectionBaseline',
