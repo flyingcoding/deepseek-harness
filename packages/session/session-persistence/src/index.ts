@@ -21,6 +21,7 @@ export type {
   SessionHandleAppendOptions,
   SessionHandleFlushOptions,
   SessionHandleReadOptions,
+  SessionHandleReadResult,
 } from './handle.ts'
 export {
   SessionAlreadyExistsError,
@@ -207,7 +208,7 @@ export abstract class SessionPersistence extends Service {
     }
     const options = signal === undefined ? undefined : { signal }
     await using handle = await this.open(id, 'read', options)
-    const events = await handle.read(0, undefined, options)
+    const { events } = await handle.read(0, undefined, options)
     signal?.throwIfAborted()
     const end = Math.min(events.length, beforeSeq ?? events.length)
     const start = Math.max(0, end - maxEvents)

@@ -10,8 +10,9 @@
 
 import { isAbsolute, join } from 'node:path'
 import {
-  decodeSeqRanges, encodeSeqRanges, SESSION_FORMAT_VERSION,
-  SessionLogOffset, SessionSeq,
+  SESSION_FORMAT_VERSION,
+  SessionLogOffset,
+  SessionSeq,
 } from '@deepseek-ai/dsh-session'
 import type {
   SessionEvent,
@@ -20,7 +21,14 @@ import type {
   SessionLogOffset as SessionLogOffsetType,
   SessionSeqCursor,
 } from '@deepseek-ai/dsh-session'
-import { parseSessionFormatLogFilename, sessionFormatLogFilename } from '@deepseek-ai/dsh-session-format'
+import {
+  parseSessionFormatLogFilename, sessionFormatLogFilename,
+  SessionFormatEventCollector, SessionFormatUnsupportedMigrationError,
+} from '@deepseek-ai/dsh-session-format'
+import type { SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
+import type { SessionFormatArtifactDecoder, SessionFormatRecovery, SessionFormatRestore } from '@deepseek-ai/dsh-session-format'
+import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
+import { assertV3RowAdmission, releasedV3SessionFormatCodec } from '@deepseek-ai/dsh-session-format-v2-to-v3'
 import {
   SessionFormatUnsupportedError,
   sessionFormatVersionRefusal,
@@ -74,7 +82,7 @@ export function parseGenerationLogFilename(
 }
 
 /**
- * The current v2 physical header stored as the first JSONL record. The exact
+ * The current physical header stored as the first JSONL record. The exact
  * inherited cut lives on the last tagged `session/end-seed` event.
  */
 interface HeaderLine {
@@ -124,18 +132,10 @@ export function toHeaderLine(
   if (!header.isSeeded && cut !== 0) {
     throw new Error('unseeded session header inherited event count must be 0')
   }
-  return {
-    type: 'session',
-    version: header.version,
-    id: header.id,
-    createdAt: header.createdAt,
-    ...header.cwd !== undefined ? { cwd: header.cwd } : {},
-    ...header.parentSession !== undefined ? { parentSession: header.parentSession } : {},
-    isSeeded: header.isSeeded,
-    ...header.origin !== undefined ? { origin: header.origin } : {},
+  return sessionFormatCatalog.encodeCurrentHeader({
+    ...header,
     delegationDepth: header.delegationDepth ?? 0,
-    ...header.agentPreset !== undefined ? { agentPreset: header.agentPreset } : {},
-  }
+  }, cut) as unknown as HeaderLine
 }
 
 /**
@@ -310,44 +310,22 @@ export function logPath(
 }
 
 /**
- * Serialize a v2 event batch as JSONL lines (no trailing newline). Compact
+ * Serialize a current event batch as JSONL lines (no trailing newline). Compact
  * Assistant streams are nested event data; every event occupies one row.
  * @param events - the batch to serialize, in log order.
  * @returns the batch's JSONL text; the writer adds the final newline.
  */
 export function eventLines(events: readonly SessionEvent[]): string {
-  return events.map(record => JSON.stringify(encodeProvenanceForStorage(record))).join('\n')
+  return events.map(eventLine).join('\n')
 }
 
 /**
- * Losslessly shrink a record's `sourceEventSeqs` for the log: consecutive
- * runs of at least three seqs become `[start, end]` pairs, and any other list
- * stays verbatim.
- * @param record - one stored record (event or packed row).
- * @returns the record with its provenance in storage form (widened from the
- *   in-memory `SessionSeq[]`; {@link expandProvenanceFromStorage} restores it).
+ * Serialize one current event as one JSONL record without its trailing newline.
+ * @param event - current event to encode.
+ * @returns one physical JSON record.
  */
-function encodeProvenanceForStorage(record: SessionEvent): unknown {
-  if (!('sourceEventSeqs' in record)) return record
-  return { ...record, sourceEventSeqs: encodeSeqRanges(record.sourceEventSeqs) }
-}
-
-/**
- * Expand a parsed line's storage-form provenance back to `SessionSeq[]`.
- * @param parsed - the JSON-parsed value of one stored line.
- * @returns the value with provenance expanded.
- * @throws when the record or its storage-form provenance is malformed.
- */
-function expandProvenanceFromStorage(parsed: unknown): unknown {
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new TypeError('stored session records must be objects')
-  }
-  const record = parsed as { seq?: unknown; sourceEventSeqs?: unknown }
-  if (record.sourceEventSeqs === undefined) return parsed
-  if (!Number.isSafeInteger(record.seq) || (record.seq as number) < 0) {
-    throw new TypeError('stored session event seq must be a non-negative safe integer')
-  }
-  return { ...record, sourceEventSeqs: decodeSeqRanges(record.sourceEventSeqs, record.seq as number) }
+export function eventLine(event: SessionEvent): string {
+  return JSON.stringify(sessionFormatCatalog.encodeCurrentEvent(event as unknown as SessionFormatEvent))
 }
 
 interface SessionLogScan {
@@ -375,20 +353,18 @@ export interface SessionLogWindowOptions {
   onEvent?: (event: SessionEvent) => void
 }
 
-/** Derive the v2 fork cut from the last lineage-tagged seed marker. */
-function inheritedCut(meta: SessionHeader, events: readonly SessionEvent[]): SessionLogOffsetType {
-  let cut: SessionLogOffsetType | undefined
-  for (const event of events) {
-    if (event.type === 'session/end-seed' && event.data.inherited === true) cut = SessionLogOffset(event.seq)
-  }
-  if (meta.isSeeded && cut === undefined) {
-    throw new Error('corrupt session log: seeded v2 header lacks an inherited end-seed marker')
-  }
-  if (!meta.isSeeded && cut !== undefined) {
-    throw new Error('corrupt session log: unseeded v2 header contains an inherited end-seed marker')
-  }
-  return cut ?? SessionLogOffset(0)
+interface WindowDecoderState {
+  readonly kind: 'window'
+  readonly decoder: SessionFormatArtifactDecoder
+  readonly collector: SessionFormatEventCollector
+  readonly options: SessionLogWindowOptions
+  readonly events: SessionEvent[]
+  index: number
 }
+
+type ScannerDecoderState =
+  | { readonly kind: 'complete'; readonly restore: SessionFormatRestore }
+  | WindowDecoderState
 
 /**
  * Refuse a header carrying a format version this build does not read BEFORE
@@ -397,8 +373,7 @@ function inheritedCut(meta: SessionHeader, events: readonly SessionEvent[]): Ses
  * must see "upgrade the harness", never "corrupt session log".
  * @param parsed - the JSON-parsed first line of a session artifact.
  */
-function refuseForeignFormatVersion(parsed: unknown): void {
-  if (typeof parsed !== 'object' || parsed === null) return
+function refuseForeignFormatVersion(parsed: object): void {
   const { version, id } = parsed as { version?: unknown; id?: unknown }
   if (typeof version !== 'number' || version === SESSION_FORMAT_VERSION) return
   throw new SessionFormatUnsupportedError(
@@ -407,7 +382,7 @@ function refuseForeignFormatVersion(parsed: unknown): void {
 }
 
 /** Parse one complete header record supplied independently from event rows. */
-function parseHeaderRecord(record: Buffer): ReturnType<typeof fromHeaderLine> {
+function parseHeaderRecord(record: Buffer): { readonly meta: SessionHeader; readonly header: HeaderLine } {
   if (record.length === 0 || record.at(-1) !== 0x0A || record.indexOf(0x0A) !== record.length - 1) {
     throw new Error('empty or header-less session log')
   }
@@ -417,12 +392,15 @@ function parseHeaderRecord(record: Buffer): ReturnType<typeof fromHeaderLine> {
   } catch {
     throw new Error('corrupt session log: header line is not valid JSON')
   }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('corrupt session log: first line is not a JSON object')
+  }
   refuseForeignFormatVersion(parsed)
   assertNoRetiredHeaderFields(parsed)
   if (!isHeaderLine(parsed)) {
     throw new Error('corrupt session log: first line is not a session header')
   }
-  return fromHeaderLine(parsed)
+  return { meta: fromHeaderLine(parsed).meta, header: parsed }
 }
 
 /**
@@ -433,10 +411,8 @@ function parseHeaderRecord(record: Buffer): ReturnType<typeof fromHeaderLine> {
  */
 export class SessionLogScanner {
   private readonly meta: SessionHeader
-  private readonly events: SessionEvent[] = []
-  private nextSeq = SessionLogOffset(0)
-  private windowIndex = 0
-  private inheritedMarker: SessionEvent | undefined
+  private readonly reader: ScannerDecoderState
+  private eventCount = 0
   private fragments: Buffer[] = []
   private fragmentBytes = 0
   private inputBytes: number
@@ -448,11 +424,33 @@ export class SessionLogScanner {
   /**
    * Create an event scanner from exactly one newline-terminated header record.
    * @param headerRecord - the complete first JSONL record, including its newline.
+   * @param recovery - whether an invalid unsealed tail may be excluded.
    * @param window - optional bounded retention policy; every row is still validated.
    */
-  constructor(headerRecord: Buffer, private readonly window?: SessionLogWindowOptions) {
+  constructor(
+    headerRecord: Buffer,
+    private readonly recovery: SessionFormatRecovery = 'recoverable',
+    window?: SessionLogWindowOptions,
+  ) {
     const parsed = parseHeaderRecord(headerRecord)
     this.meta = parsed.meta
+    try {
+      this.reader = window === undefined
+        ? { kind: 'complete', restore: sessionFormatCatalog.createRestore(parsed.header, {
+          recovery: 'strict', validation: 'transformed',
+        }) }
+        : {
+          kind: 'window',
+          decoder: releasedV3SessionFormatCodec.createDecoder(parsed.header, 'strict'),
+          collector: new SessionFormatEventCollector(),
+          options: window,
+          events: [],
+          index: 0,
+        }
+    } catch {
+      /* v8 ignore next -- isHeaderLine matches the current codec; preserve classification if it tightens. */
+      throw new Error('corrupt session log: first line is not a session header')
+    }
     this.inputBytes = headerRecord.length
     this.committedBytes = headerRecord.length
   }
@@ -501,7 +499,7 @@ export class SessionLogScanner {
     return {
       inputBytes: this.inputBytes,
       committedBytes: this.committedBytes,
-      eventCount: this.nextSeq,
+      eventCount: SessionLogOffset(this.eventCount),
     }
   }
 
@@ -510,31 +508,34 @@ export class SessionLogScanner {
    * @returns the header, contiguous event prefix, and safe truncation offset.
    */
   finish(): SessionLogScan {
-    if (this.window !== undefined) throw new Error('bounded scanner must finish with finishWindow()')
+    if (this.reader.kind !== 'complete') throw new Error('bounded scanner must finish with finishWindow()')
     this.finished = true
+    const artifact = this.reader.restore.finish()
     return {
       meta: this.meta,
-      inheritedEventCount: inheritedCut(this.meta, this.events),
-      events: this.events,
+      inheritedEventCount: SessionLogOffset(artifact.inheritedEventCount),
+      events: artifact.events as unknown as SessionEvent[],
       committedBytes: this.committedBytes,
     }
   }
 
   /**
-   * Finish a bounded scan after checking every complete row.
+   * Finish a bounded scan after checking every complete row and the exact fork cut.
    * @returns the retained events, lineage cut, and complete stored cursor.
    */
   finishWindow(): SessionLogWindowScan {
-    if (this.window === undefined) throw new Error('scanner has no bounded-window policy')
+    const reader = this.reader
+    if (reader.kind !== 'window') throw new Error('scanner has no bounded-window policy')
     this.finished = true
-    const events = this.windowIndex === 0
-      ? this.events
-      : [...this.events.slice(this.windowIndex), ...this.events.slice(0, this.windowIndex)]
+    const inheritedEventCount = SessionLogOffset(reader.decoder.finish(reader.collector))
+    const events = reader.index === 0
+      ? reader.events
+      : [...reader.events.slice(reader.index), ...reader.events.slice(0, reader.index)]
     return {
       meta: this.meta,
-      inheritedEventCount: inheritedCut(this.meta, this.inheritedMarker === undefined ? [] : [this.inheritedMarker]),
+      inheritedEventCount,
       events,
-      cursor: this.nextSeq === 0 ? -1 : SessionSeq(this.nextSeq - 1),
+      cursor: this.eventCount === 0 ? -1 : SessionSeq(this.eventCount - 1),
       hasMore: events.length > 0 && (events[0] as SessionEvent).seq > 0,
       committedBytes: this.committedBytes,
     }
@@ -543,43 +544,63 @@ export class SessionLogScanner {
   /** Decode one complete event row and update the contiguous prefix. */
   private consumeEventLine(line: Buffer, endByte: number): void {
     this.eventLine += 1
-    let decoded: SessionEvent[]
+    let decoded: unknown
     try {
-      decoded = [expandProvenanceFromStorage(JSON.parse(line.toString('utf8'))) as SessionEvent]
+      decoded = JSON.parse(line.toString('utf8')) as unknown
     } catch {
-      this.issue ??= new Error(`corrupt session log: unparsable committed event at line ${this.eventLine}`)
+      const issue = new Error(`corrupt session log: unparsable committed event at line ${this.eventLine}`)
+      if (this.recovery === 'strict') throw issue
+      this.issue ??= issue
       return
+    }
+
+    // This scanner accepts only current-generation files. Owned structural refusal must
+    // precede its recoverable-tail suppression, independently of the strict decoder state.
+    try {
+      assertV3RowAdmission(decoded)
+    } catch (error: unknown) {
+      if (error instanceof SessionFormatUnsupportedMigrationError) throw new SessionFormatUnsupportedError(error.message)
+      throw error
     }
 
     if (this.issue !== undefined) {
-      if (decoded.some(event => event.type === 'turn/end')) throw this.issue
+      if (typeof decoded === 'object' && decoded !== null
+        && (decoded as { type?: unknown }).type === 'turn/end') throw this.issue
       return
     }
+    try {
+      if (this.reader.kind === 'complete') this.reader.restore.decodeRow(decoded)
+      else this.reader.decoder.decodeRow(decoded, this.reader.collector)
+    } catch (error: unknown) {
+      // Unsupported V3 rows have already been refused before recovery.
+      /* v8 ignore next -- every production Session format decoder rejects with Error. */
+      const detail = error instanceof Error ? error.message : String(error)
+      const issue = new Error(`corrupt session log: invalid committed event at line ${this.eventLine}: ${detail}`, {
+        cause: error,
+      })
+      if (this.recovery === 'strict') throw issue
+      this.issue = issue
+      if (typeof decoded === 'object' && decoded !== null
+        && (decoded as { type?: unknown }).type === 'turn/end') throw issue
+      return
+    }
+    if (this.reader.kind === 'window') this.retainWindowEvents(this.reader)
+    this.eventCount += 1
+    this.committedBytes = endByte
+  }
 
-    for (const event of decoded) {
-      if (Number(event.seq) !== Number(this.nextSeq)) {
-        const expected = this.nextSeq
-        this.issue = new Error(
-          `corrupt session log: seq gap in committed region at line ${this.eventLine} `
-          + `(expected ${expected}, got ${event.seq})`,
-        )
-        if (decoded.some(candidate => candidate.type === 'turn/end')) throw this.issue
-        return
-      }
-      if (this.window !== undefined) validateStoredEvents(this.meta, [event])
-      this.window?.onEvent?.(event)
-      this.nextSeq = SessionLogOffset(this.nextSeq + 1)
-      if (event.type === 'session/end-seed' && event.data.inherited === true) this.inheritedMarker = event
-      if (this.window === undefined || event.seq < (this.window.beforeSeq ?? Number.MAX_SAFE_INTEGER)) {
-        if (this.window === undefined || this.events.length < this.window.maxEvents) {
-          this.events.push(event)
-        } else {
-          this.events[this.windowIndex] = event
-          this.windowIndex = (this.windowIndex + 1) % this.window.maxEvents
-        }
+  /** Deliver the current row outside decoder error handling and retain only the requested window. */
+  private retainWindowEvents(reader: WindowDecoderState): void {
+    const events = validateStoredEvents(this.meta, reader.collector.values.splice(0) as SessionEvent[])
+    for (const event of events) {
+      reader.options.onEvent?.(event)
+      if (event.seq >= (reader.options.beforeSeq ?? Number.MAX_SAFE_INTEGER)) continue
+      if (reader.events.length < reader.options.maxEvents) reader.events.push(event)
+      else {
+        reader.events[reader.index] = event
+        reader.index = (reader.index + 1) % reader.options.maxEvents
       }
     }
-    this.committedBytes = endByte
   }
 }
 
@@ -600,7 +621,7 @@ export function scanLog(buffer: Buffer): SessionLogScan {
 }
 
 /**
- * Validate plaintext JSONL while retaining one backwards window.
+ * Validate current plaintext JSONL while retaining one backwards window.
  * @param buffer - complete or torn JSONL bytes.
  * @param beforeSeq - exclusive upper offset; omitted selects the tail.
  * @param maxEvents - positive event retention ceiling.
@@ -617,6 +638,7 @@ export function scanLogWindow(
   if (headerEnd === -1) throw new Error('empty or header-less session log')
   const scanner = new SessionLogScanner(
     buffer.subarray(0, headerEnd + 1),
+    'recoverable',
     { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents, ...onEvent === undefined ? {} : { onEvent } },
   )
   scanner.write(buffer.subarray(headerEnd + 1))

@@ -10,9 +10,9 @@ Status: implemented
 
 ## 决策
 
-本记录推翻了 [SQLite FTS5 会话搜索](../feature/2026-07-10-sqlite-session-query-provider.zh.md)中记录的整段查询短语语义与纯 `unicode61` 分词器选择；该记录中的提供方拓扑、文本抽取、对账生命周期与模式安全决策仍然有效。
+[SQLite 会话查询提供方](../../../../packages/session-query/session-query-sqlite/README.zh.md)负责提取、协调和 schema 安全。本记录说明字面量 AND 查询、CJK 子串索引和有界查询保留。
 
-SQLite 后端改为增量观测与增量索引。每个活跃 `Session` 在 WeakMap 缓存中持有一个增量 SHA-256 流、缓存的面层折叠结果，以及上次写入的指纹与事件 seq；事件深度冻结、公开快照数组在追加时整体替换，因此哈希流只会对自上次观测以来新追加的事件做哈希，指纹计算不再需要任何克隆。对账只为上次索引 seq 之后新追加的事件写文档，只更新新被遮蔽的旧文档（`surface = 'shadowed'`，分块 `IN` 列表），并且缓存记账只在事务提交之后应用。持久化会话的 inspect 结果不再克隆，文档在写入时流式进入索引；查询代码不保留已完成的源，共享 preparation LRU 则最多保留五个就绪 Session 且逻辑事件总数不超过 20,000，因此大型检查会在使用后退出 LRU。查询 SQL 用 `instr`/`substr` 把 `highlight()` 输出窗口化到首个命中标记附近，因此每行的 JavaScript 内存由摘要窗口而不是完整文档限定，`makeSnippet` 也在这个有界窗口上工作。
+SQLite 后端改为增量观测与增量索引。每个活跃 `Session` 在 WeakMap 缓存中持有一个增量 SHA-256 流、缓存的面层折叠结果，以及上次写入的指纹与事件 seq；事件深度冻结、公开快照数组在追加时整体替换，因此哈希流只会对自上次观测以来新追加的事件做哈希，指纹计算不再需要任何克隆。对账只为上次索引 seq 之后新追加的事件写文档，只更新新被遮蔽的旧文档（`surface = 'shadowed'`，分块 `IN` 列表），并且缓存记账只在事务提交之后应用。持久化会话的 inspect 结果不再克隆，文档在写入时流式进入索引；查询代码不保留已完成的源，共享 preparation LRU 则通过 `preparedSessionCacheSize` 限制就绪 Session 数量，并通过 `preparedSessionCacheMaxEvents` 限制逻辑事件数，因此大型检查会在使用后退出 LRU。查询 SQL 用 `instr`/`substr` 把 `highlight()` 输出窗口化到首个命中标记附近，因此每行的 JavaScript 内存由摘要窗口而不是完整文档限定，`makeSnippet` 也在这个有界窗口上工作。
 
 中文文本支持任意长度的搜索：每个中文连续段都以零宽空格分隔的 unigram+bigram token 流存储（模式版本 9 会在原地重置版本 8 的派生索引），查询把其中的中文段展开为同样的 bigram（单字保留 unigram）。以空白分隔的查询词条作为独立加引号的字面量做 AND 匹配，调用方的 MATCH 语法始终是惰性数据，也不再要求相邻。摘要把 token 流解码回可读文本：完整的连续段从 unigram 前缀读回；窗口片段锚定在第一个被标记的 token 上，因此超长连续段的窗口从命中位置开始仍显示精确字符。浏览器 fixture 同步了 AND 与中文 bigram 匹配语义。
 

@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-08-16-session-search-cjk-incremental-index.md
-2026-08-16-session-search-cjk-incremental-index.md: ff0d5653851e92804731a709e8cdad67dc4e8d54
-2026-08-16-session-search-cjk-incremental-index.zh.md: c425b24768950d8ac11630606cf3baf5769cb32d
+2026-08-16-session-search-cjk-incremental-index.md: 80074eedd3cbfa0814c962b81510ca372f6376de
+2026-08-16-session-search-cjk-incremental-index.zh.md: 789b0696f2267764c2867aea2b5e49d22e3443b5
