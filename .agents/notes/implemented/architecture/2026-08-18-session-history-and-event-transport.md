@@ -137,8 +137,6 @@ If a page request is canceled with its physical carrier generation, the journal 
 
 ### Session Controller
 
-The command UI discovers Agent-bound commands only for an explicit candidate query or submission. Background prewarming would enter the general Agent lookup and defeat bounded cold history by resuming the complete Session.
-
 `packages/api/session-controller` provides Host `ctx.sessionController` and the generated `ctx.remote.session` namespace.
 
 It owns Session list, search, create, selectModel, rename, fork, prompt, attachment, updateQueue, cancel, page, follow, and control. The Host-generation model catalog is exposed separately through `session/modelCatalog` because it is not Session-specific.
@@ -157,7 +155,7 @@ Each method explicitly selects a cold inspection, live-only lookup, or resume-ca
 |---|---|---|
 | `session.list`, `search` | headers and projection cache; a bounded small-log read can resolve uncertain blankness | Never resumes an Agent |
 | `session.page(address)` | attached Session or persistence log | Never resumes an Agent |
-| `session.follow(address)` | one live or prepared observation carrying the opening page and projections | Publishes the snapshot first; only a prepared ordinary source promotes in the background |
+| `session.follow(address)` | one live or prepared observation carrying the opening page and projections | Publishes the snapshot first, then promotes an ordinary cold Session once in the background |
 | `session.control()` | current attached Agents, pending registry, and process-local registries | Baseline and reconnect do not resume an Agent |
 | `session.attachment`, fork source read | authorized durable Session data | A read does not resume an Agent |
 | `session.updateQueue` | live Agent or ordinary persisted Session | Resumes an ordinary cold Session before mutating its Inbox |
@@ -185,7 +183,7 @@ Ordinary Sessions and direct subagents use one `SessionAddress` protocol. A dire
 
 The first follow response is a complete `{ type: 'snapshot', header, cursor, events, hasMore, projections }` frame. Every reconnect sends another complete snapshot replacement; the protocol has no `afterSeq`. Events committed during observation remain buffered and are emitted after the snapshot in sequence order.
 
-A completed cold ordinary Session larger than the configured event window publishes a bounded snapshot without promotion; this keeps history viewing from retaining its complete log. Smaller or interrupted cold Sessions can publish their prepared snapshot immediately. After that first frame, the Controller transfers a retained observation to one background promotion; follow does not wait for activation. Direct-subagent addresses never use this promotion path.
+A cold ordinary Session can publish its prepared snapshot immediately. After that first frame, the Controller transfers a retained observation to one background promotion; follow does not wait for activation. Direct-subagent addresses never use this promotion path.
 
 Client `SessionEventStream` extends `RemoteJournalStream` and supplies only `session.follow`, `session.page`, the Session sequence algorithm, and repair requests. The general layer validates and publishes the opening snapshot directly. It calls `session.page({ throughSeq })` only for older history or when a later event reveals a sequence gap.
 
@@ -368,7 +366,7 @@ Static checks pin that API Proxy exports no Session/Workspace Host-frame carrier
 
 ## Consequences
 
-The browser can read a durable Session while its Agent is stopped. Opening an ordinary prepared Session publishes its snapshot before one background promotion begins; a bounded cold-history opening stays inactive; list, search, page, and other observation-only reads never activate it.
+The browser can read a durable Session while its Agent is stopped. Opening an ordinary Session publishes the prepared snapshot before one background promotion begins; list, search, page, and other observation-only reads never activate it.
 
 Durable logs repair a missing suffix by sequence number and page; Session control and Workspace state converge through opening snapshots; ordinary Remote Events promise no replay. Recovery semantics follow the data kind instead of imitating one another.
 

@@ -7,8 +7,7 @@
  */
 
 import { Context, Service } from '@deepseek-ai/cordis'
-import { SessionLogOffset } from '@deepseek-ai/dsh-session'
-import type { SessionEvent, SessionHeader, SessionId, SessionSeqCursor } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionHeader, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import type { SessionHandle, SessionAccess } from './handle.ts'
 import type { SessionPersistenceRevision } from './revision.ts'
 
@@ -89,28 +88,6 @@ export interface SessionInspection extends SessionStorageMetadata {
   readonly events: readonly SessionEvent[]
 }
 
-/** A bounded contiguous window from one validated stored Session prefix. */
-export interface SessionPersistenceWindow extends SessionStorageMetadata {
-  /** Logical events ending before the requested offset. */
-  readonly events: readonly SessionEvent[]
-  /** Last sequence in the complete stored prefix, or -1 when empty. */
-  readonly cursor: SessionSeqCursor
-  /** Whether stored events precede this window. */
-  readonly hasMore: boolean
-}
-
-/**
- * Select a visitor for the complete validated prefix that produced a window.
- * The visitor receives every event from seq 0, including events outside the
- * retained window, in sequence order. Callers publish derived state only after
- * `readWindow` succeeds; returning undefined skips the additional traversal.
- * @param window - the exact window and lineage metadata for this read.
- * @returns a synchronous event visitor, or undefined when no fold is needed.
- */
-export type SessionPersistenceWindowVisitor = (
-  window: SessionPersistenceWindow,
-) => ((event: SessionEvent) => void) | undefined
-
 /** Options for {@link SessionPersistence.open}. */
 export interface SessionPersistenceOpenOptions {
   /** Optional cancellation observed before backend work starts. */
@@ -156,6 +133,9 @@ declare module '@deepseek-ai/cordis' {
  * on this backend instance observe at least that prefix.
  */
 export abstract class SessionPersistence extends Service {
+  /** Process-local instance identity, stable through Context proxies and distinct after service replacement. */
+  readonly identity: symbol = Symbol('sessionPersistence')
+
   constructor(ctx: Context) {
     super(ctx, 'sessionPersistence')
   }
@@ -183,51 +163,6 @@ export abstract class SessionPersistence extends Service {
    * @throws {SessionAlreadyOwnedError} for `write` when ownership is taken.
    */
   abstract open(id: SessionId, access: SessionAccess, options?: SessionPersistenceOpenOptions): Promise<SessionHandle>
-
-  /**
-   * Read a backwards window without taking write ownership. The default
-   * implementation reads through a short-lived handle; sequential backends
-   * override it to validate the log while retaining only the requested window.
-   * @param id - the stored session to read.
-   * @param beforeSeq - exclusive upper offset; omitted selects the tail.
-   * @param maxEvents - positive safe-integer event ceiling.
-   * @param signal - optional cancellation for the read.
-   * @param visit - optional complete-prefix visitor selected from the validated window.
-   * @returns the bounded events, complete stored cursor, and storage metadata.
-   */
-  async readWindow(
-    id: SessionId,
-    beforeSeq: SessionLogOffset | undefined,
-    maxEvents: number,
-    signal?: AbortSignal,
-    visit?: SessionPersistenceWindowVisitor,
-  ): Promise<SessionPersistenceWindow> {
-    if (beforeSeq !== undefined) SessionLogOffset(beforeSeq)
-    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1) {
-      throw new TypeError('maxEvents must be a positive safe integer')
-    }
-    const options = signal === undefined ? undefined : { signal }
-    await using handle = await this.open(id, 'read', options)
-    const { events } = await handle.read(0, undefined, options)
-    signal?.throwIfAborted()
-    const end = Math.min(events.length, beforeSeq ?? events.length)
-    const start = Math.max(0, end - maxEvents)
-    const window: SessionPersistenceWindow = {
-      meta: handle.header,
-      inheritedEventCount: handle.inheritedEventCount,
-      events: events.slice(start, end),
-      cursor: events.at(-1)?.seq ?? -1,
-      hasMore: start > 0,
-    }
-    const onEvent = visit?.(window)
-    if (onEvent !== undefined) {
-      for (const event of events) {
-        signal?.throwIfAborted()
-        onEvent(event)
-      }
-    }
-    return window
-  }
 
   /**
    * Flush every active write handle owned by this service instance in one

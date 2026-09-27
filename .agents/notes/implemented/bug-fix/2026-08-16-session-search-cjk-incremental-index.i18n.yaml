@@ -1,6 +1,19 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for 2026-08-16-session-search-cjk-incremental-index.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/bug-fix/2026-08-16-session-search-cjk-incremental-index.md
-2026-08-16-session-search-cjk-incremental-index.md: 80074eedd3cbfa0814c962b81510ca372f6376de
-2026-08-16-session-search-cjk-incremental-index.zh.md: 789b0696f2267764c2867aea2b5e49d22e3443b5
+/agent-note-incremental-session-search-indexing-with-cjk-substring-support:
+  en: 1f2d0a9c9b0bdbcc
+  zh: e4dd0532e9ec1964
+/agent-note-incremental-session-search-indexing-with-cjk-substring-support/problem:
+  en: 4300f9701c01c0f9
+  zh: 5648d455746220aa
+/agent-note-incremental-session-search-indexing-with-cjk-substring-support/decision:
+  en: 97c5cf16410d1448
+  zh: 62765f9228014a2f
+/agent-note-incremental-session-search-indexing-with-cjk-substring-support/alternatives-considered:
+  en: e7a729ebc7eca383
+  zh: 33170cf48cedd265
+/agent-note-incremental-session-search-indexing-with-cjk-substring-support/consequences:
+  en: 03b9ce7f23c16b9b
+  zh: 0803f9b572fa85a6

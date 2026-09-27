@@ -4,11 +4,11 @@ English | [中文](persistence.zh.md)
 
 The **durability seam** for the event log. [session.md](session.md) describes the in-memory `Session` — the append-only `SessionEvent` log that is the source of truth. This page describes how that log is made durable: the abstract `SessionPersistence` service, its provider model and shipped JSONL backend, the flush checkpoint, crash recovery, and the metadata header that travels alongside the log. The event vocabulary the log carries is enumerated, member by member, in the generated [persistence log event catalog](../persistence-catalog.md).
 
-The seam is a [capability seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.md): one abstract service ([dsh-session-persistence](../../packages/session/session-persistence), `ctx.sessionPersistence`) exposing `create`/`open`/`stat`/`list`/`readWindow` over the existing `SessionEvent` — **no parallel persisted event type** — where `create` and `open` return a per-session `SessionHandle` (`read`/`append`/`flush`/`close`) that carries mutable log access and single-writer ownership. The repository ships [dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl) as its provider; out-of-tree providers may implement the same service contract. See the [handle-based persistence Agent Note](../../.agents/notes/implemented/architecture/2026-08-27-handle-based-session-persistence.md) and the [session-persistence Agent Note](../../.agents/notes/implemented/architecture/2026-06-14-session-persistence.md).
+The seam is a [capability seam](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.md): one abstract service ([dsh-session-persistence](../../packages/session/session-persistence), `ctx.sessionPersistence`) exposing `create`/`open`/`stat`/`list` over the existing `SessionEvent` — **no parallel persisted event type** — where `create` and `open` return a per-session `SessionHandle` (`read`/`append`/`flush`/`close`) that carries all log access and single-writer ownership. The repository ships [dsh-session-persistence-jsonl](../../packages/session/session-persistence-jsonl) as its provider; out-of-tree providers may implement the same service contract. See the [handle-based persistence Agent Note](../../.agents/notes/implemented/architecture/2026-08-27-handle-based-session-persistence.md) and the [session-persistence Agent Note](../../.agents/notes/implemented/architecture/2026-06-14-session-persistence.md).
 
 ## `SessionHandle` — one open channel onto a stored session
 
-Log mutations and ordinary range reads flow through a handle. The separate `readWindow` service method performs an observation without write ownership. A read returns a caller-owned outer slice and the producer-established aliasing state of its event values. One handle type serves both accesses — a mutation on a `read` handle is a runtime `SessionReadOnlyError` rather than a typed split — and in-process single-writer ownership makes a second `open(id, 'write')` reject with `SessionAlreadyOwnedError` while an owner is active.
+Every log read and write flows through a handle, never through id-addressed service methods: the handle is the single door the cross-process write lease guards. A read returns a caller-owned outer slice and the producer-established aliasing state of its event values. One handle type serves both accesses — a mutation on a `read` handle is a runtime `SessionReadOnlyError` rather than a typed split — and in-process single-writer ownership makes a second `open(id, 'write')` reject with `SessionAlreadyOwnedError` while an owner is active.
 
 ```ts type-equiv
 /** One persistence event slice returned by {@link SessionHandle.read}. */
@@ -100,36 +100,6 @@ interface SessionHandle extends AsyncDisposable {
 ```
 
 A created session is observable in this process from the moment `create` resolves, while a backend may defer physical materialization (a pure optimization) until the first `append` or `flush`; other processes see only materialized sessions, and a session that never materialized before a crash never existed.
-
-## Bounded history windows
-
-Use `readWindow` for a backwards slice while deriving state from the complete stored prefix. The [bounded replay decision](../../.agents/notes/implemented/bug-fix/2026-09-06-bounded-history-projection-replay.md) explains event retention and exact fork initialization.
-
-```ts type-equiv
-/** A bounded contiguous window from one validated stored Session prefix. */
-interface SessionPersistenceWindow extends SessionStorageMetadata {
-  /** Logical events ending before the requested offset. */
-  readonly events: readonly SessionEvent[]
-  /** Last sequence in the complete stored prefix, or -1 when empty. */
-  readonly cursor: SessionSeqCursor
-  /** Whether stored events precede this window. */
-  readonly hasMore: boolean
-}
-```
-
-```ts type-equiv
-/**
- * Select a visitor for the complete validated prefix that produced a window.
- * The visitor receives every event from seq 0, including events outside the
- * retained window, in sequence order. Callers publish derived state only after
- * `readWindow` succeeds; returning undefined skips the additional traversal.
- * @param window - the exact window and lineage metadata for this read.
- * @returns a synchronous event visitor, or undefined when no fold is needed.
- */
-type SessionPersistenceWindowVisitor = (
-  window: SessionPersistenceWindow,
-) => ((event: SessionEvent) => void) | undefined
-```
 
 ## The flush checkpoint
 
@@ -233,8 +203,8 @@ interface CreateSessionOptions {
   readonly seed?: readonly SessionEvent[]
   /**
    * Exact fork-inherited prefix length when `meta.isSeeded` is true. The
-   * constructor seed is exactly this inherited prefix; the constructor
-   * appends the child-owned tagged marker at the cut.
+   * constructor appends the child-owned tagged marker at the cut unless
+   * the seed already includes it followed by child-owned fork closers.
    */
   readonly inheritedEventCount?: SessionLogOffset
   /**
@@ -404,19 +374,6 @@ abstract create(header: SessionHeader, options?: SessionPersistenceCreateOptions
 abstract open(id: SessionId, access: SessionAccess, options?: SessionPersistenceOpenOptions): Promise<SessionHandle>
 
 /**
- * Read a backwards window without taking write ownership. The default
- * implementation reads through a short-lived handle; sequential backends
- * override it to validate the log while retaining only the requested window.
- * @param id - the stored session to read.
- * @param beforeSeq - exclusive upper offset; omitted selects the tail.
- * @param maxEvents - positive safe-integer event ceiling.
- * @param signal - optional cancellation for the read.
- * @param visit - optional complete-prefix visitor selected from the validated window.
- * @returns the bounded events, complete stored cursor, and storage metadata.
- */
-async readWindow( id: SessionId, beforeSeq: SessionLogOffset | undefined, maxEvents: number, signal?: AbortSignal, visit?: SessionPersistenceWindowVisitor, ): Promise<SessionPersistenceWindow>
-
-/**
  * Flush every active write handle owned by this service instance in one
  * durability barrier: each handle's routed live events drain durably and
  * its session materializes, exactly as that handle's own
@@ -453,7 +410,7 @@ abstract stat(id: SessionId, options?: SessionPersistenceStatOptions): Promise<S
 abstract list(options?: SessionPersistenceListOptions): Promise<readonly SessionPersistenceSnapshot[]>
 ```
 
-Types: [SessionId](core.md) · [SessionLogOffset](session.md)
+Types: [SessionId](core.md)
 
 Source: [`packages/session/session-persistence/src/index.ts`](../../packages/session/session-persistence/src/index.ts)
 <!-- END GENERATED cordis-surface -->

@@ -137,8 +137,6 @@ repair 期间旧 window 保持可读；page 与期间积累的 live entries 拼�
 
 ### Session Controller
 
-命令 UI 只在显式请求候选项或提交命令时发现依赖 Agent 的命令。后台预热会进入通用 Agent 查找，通过恢复完整 Session 破坏冷历史的有界读取。
-
 `packages/api/session-controller` 提供 Host `ctx.sessionController` 与生成的 `ctx.remote.session` namespace。
 
 它拥有 Session list、search、create、selectModel、rename、fork、prompt、attachment、updateQueue、cancel、page、follow 与 control。Host generation 的 model catalog 通过独立的 `session/modelCatalog` 公开，因为它不属于特定 Session。
@@ -157,7 +155,7 @@ Session Remote 方法传递 `SessionId` 或 `SessionAddress`，不靠参数类�
 |---|---|---|
 | `session.list`、`search` | header 与投影缓存；可通过有界的小日志读取判断不确定的 blank 状态 | 永不恢复 Agent |
 | `session.page(address)` | attached Session 或 persistence 日志 | 永不恢复 Agent |
-| `session.follow(address)` | 一份携带 opening page 与 projection 的 live 或 prepared observation | 先发布 snapshot；只有 prepared 普通源在后台执行 promotion |
+| `session.follow(address)` | 一份携带 opening page 与 projection 的 live 或 prepared observation | 先发布 snapshot，再在后台把普通冷 Session 提升一次 |
 | `session.control()` | 当前 attached Agent、pending registry 与进程内 registry | baseline 与重连不恢复 Agent |
 | `session.attachment`、fork 源读取 | 已授权的持久 Session 数据 | 读取不恢复 Agent |
 | `session.updateQueue` | live Agent 或普通持久 Session | 修改 Inbox 前恢复普通冷 Session |
@@ -185,7 +183,7 @@ tail page 同时携带不晚于 `throughSeq` 的 projection baseline；旧页只
 
 首次 follow 返回完整的 `{ type: 'snapshot', header, cursor, events, hasMore, projections }` frame。每次重连都发送另一份完整 snapshot replacement；协议不含 `afterSeq`。观察期间提交的 event 会保留在缓冲区，并在 snapshot 之后按 seq 发出。
 
-已完成且大于配置事件窗口的普通冷 Session 发布有界 snapshot，不触发 promotion，使历史查看无需保留完整日志。较小或中断的普通冷 Session 可以立即发布 prepared snapshot。首帧之后，Controller 把 retained observation 交给一次后台 promotion；follow 不等待激活。Direct-subagent 地址不会进入该 promotion 路径。
+普通冷 Session 可以立即发布 prepared snapshot。首帧之后，Controller 把 retained observation 交给一次后台 promotion；follow 不等待激活。Direct-subagent 地址不会进入该 promotion 路径。
 
 Client 的 `SessionEventStream` 继承 `RemoteJournalStream`，只提供 `session.follow`、`session.page`、Session seq 算法与 repair request。通用层直接校验并发布 opening snapshot；仅在读取更早历史或后续 event 暴露 seq gap 时调用 `session.page({ throughSeq })`。
 
@@ -368,7 +366,7 @@ Remote Event Client 测试固定实例私有 key、Cordis 注册顺序、Agent C
 
 ## 后果
 
-浏览器可以在 Agent 停止时读取持久 Session。打开普通 prepared Session 时先发布 snapshot，再开始一次后台 promotion；有界冷历史打开保持未激活状态；list、search、page 及其他只读 observation 不会激活 Agent。
+浏览器可以在 Agent 停止时读取持久 Session。打开普通 Session 时先发布 prepared snapshot，再开始一次后台 promotion；list、search、page 及其他只读 observation 不会激活 Agent。
 
 持久日志用 seq 与 page 修复缺失后缀；Session control 和 Workspace state 用 opening snapshot 收敛；普通 Remote Event 不承诺重放。恢复语义由数据类型决定，不再互相模拟。
 

@@ -11,28 +11,23 @@
 import { isAbsolute, join } from 'node:path'
 import {
   SESSION_FORMAT_VERSION,
+  KNOWN_SESSION_EVENT_TYPES,
   SessionLogOffset,
-  SessionSeq,
 } from '@deepseek-ai/dsh-session'
 import type {
   SessionEvent,
   SessionHeader,
   SessionId,
   SessionLogOffset as SessionLogOffsetType,
-  SessionSeqCursor,
 } from '@deepseek-ai/dsh-session'
-import {
-  parseSessionFormatLogFilename, sessionFormatLogFilename,
-  SessionFormatEventCollector, SessionFormatUnsupportedMigrationError,
-} from '@deepseek-ai/dsh-session-format'
+import { parseSessionFormatLogFilename, sessionFormatLogFilename, SessionFormatUnsupportedMigrationError } from '@deepseek-ai/dsh-session-format'
 import type { SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
-import type { SessionFormatArtifactDecoder, SessionFormatRecovery, SessionFormatRestore } from '@deepseek-ai/dsh-session-format'
+import type { SessionFormatRecovery, SessionFormatRestore } from '@deepseek-ai/dsh-session-format'
 import { sessionFormatCatalog } from '@deepseek-ai/dsh-session-format-catalog'
-import { assertV3RowAdmission, releasedV3SessionFormatCodec } from '@deepseek-ai/dsh-session-format-v2-to-v3'
+import { assertV4RowAdmission, assertReleasedV4Relationships } from '@deepseek-ai/dsh-session-format-v3-to-v4'
 import {
   SessionFormatUnsupportedError,
   sessionFormatVersionRefusal,
-  validateStoredEvents,
   type SessionStorageMetadata,
 } from '@deepseek-ai/dsh-session-persistence'
 
@@ -335,37 +330,6 @@ interface SessionLogScan {
   committedBytes: number
 }
 
-/** A validated complete prefix with only its requested logical window retained. */
-export interface SessionLogWindowScan extends SessionLogScan {
-  /** Last sequence in the complete prefix, or -1 when empty. */
-  cursor: SessionSeqCursor
-  /** Whether events precede the retained window. */
-  hasMore: boolean
-}
-
-/** Event retention policy for a sequential window scan. */
-export interface SessionLogWindowOptions {
-  /** Exclusive upper offset; omission selects the tail. */
-  beforeSeq?: SessionLogOffsetType
-  /** Positive safe-integer ceiling on retained events. */
-  maxEvents: number
-  /** Receive every validated event, including rows outside the retained window. */
-  onEvent?: (event: SessionEvent) => void
-}
-
-interface WindowDecoderState {
-  readonly kind: 'window'
-  readonly decoder: SessionFormatArtifactDecoder
-  readonly collector: SessionFormatEventCollector
-  readonly options: SessionLogWindowOptions
-  readonly events: SessionEvent[]
-  index: number
-}
-
-type ScannerDecoderState =
-  | { readonly kind: 'complete'; readonly restore: SessionFormatRestore }
-  | WindowDecoderState
-
 /**
  * Refuse a header carrying a format version this build does not read BEFORE
  * validating the current header shape or decoding any event row: a future
@@ -382,7 +346,7 @@ function refuseForeignFormatVersion(parsed: object): void {
 }
 
 /** Parse one complete header record supplied independently from event rows. */
-function parseHeaderRecord(record: Buffer): { readonly meta: SessionHeader; readonly header: HeaderLine } {
+function parseHeaderRecord(record: Buffer): { readonly meta: SessionHeader; readonly restore: SessionFormatRestore } {
   if (record.length === 0 || record.at(-1) !== 0x0A || record.indexOf(0x0A) !== record.length - 1) {
     throw new Error('empty or header-less session log')
   }
@@ -400,7 +364,17 @@ function parseHeaderRecord(record: Buffer): { readonly meta: SessionHeader; read
   if (!isHeaderLine(parsed)) {
     throw new Error('corrupt session log: first line is not a session header')
   }
-  return { meta: fromHeaderLine(parsed).meta, header: parsed }
+  let restore: SessionFormatRestore
+  try {
+    restore = sessionFormatCatalog.createRestore(parsed, {
+      recovery: 'strict',
+      validation: 'transformed',
+    })
+  } catch {
+    /* v8 ignore next -- isHeaderLine matches the current codec; this preserves classification if it tightens. */
+    throw new Error('corrupt session log: first line is not a session header')
+  }
+  return { meta: fromHeaderLine(parsed).meta, restore }
 }
 
 /**
@@ -411,7 +385,7 @@ function parseHeaderRecord(record: Buffer): { readonly meta: SessionHeader; read
  */
 export class SessionLogScanner {
   private readonly meta: SessionHeader
-  private readonly reader: ScannerDecoderState
+  private readonly restore: SessionFormatRestore
   private eventCount = 0
   private fragments: Buffer[] = []
   private fragmentBytes = 0
@@ -424,33 +398,14 @@ export class SessionLogScanner {
   /**
    * Create an event scanner from exactly one newline-terminated header record.
    * @param headerRecord - the complete first JSONL record, including its newline.
-   * @param recovery - whether an invalid unsealed tail may be excluded.
-   * @param window - optional bounded retention policy; every row is still validated.
    */
   constructor(
     headerRecord: Buffer,
     private readonly recovery: SessionFormatRecovery = 'recoverable',
-    window?: SessionLogWindowOptions,
   ) {
     const parsed = parseHeaderRecord(headerRecord)
     this.meta = parsed.meta
-    try {
-      this.reader = window === undefined
-        ? { kind: 'complete', restore: sessionFormatCatalog.createRestore(parsed.header, {
-          recovery: 'strict', validation: 'transformed',
-        }) }
-        : {
-          kind: 'window',
-          decoder: releasedV3SessionFormatCodec.createDecoder(parsed.header, 'strict'),
-          collector: new SessionFormatEventCollector(),
-          options: window,
-          events: [],
-          index: 0,
-        }
-    } catch {
-      /* v8 ignore next -- isHeaderLine matches the current codec; preserve classification if it tightens. */
-      throw new Error('corrupt session log: first line is not a session header')
-    }
+    this.restore = parsed.restore
     this.inputBytes = headerRecord.length
     this.committedBytes = headerRecord.length
   }
@@ -508,35 +463,13 @@ export class SessionLogScanner {
    * @returns the header, contiguous event prefix, and safe truncation offset.
    */
   finish(): SessionLogScan {
-    if (this.reader.kind !== 'complete') throw new Error('bounded scanner must finish with finishWindow()')
     this.finished = true
-    const artifact = this.reader.restore.finish()
+    const artifact = this.restore.finish()
+    assertReleasedV4Relationships(artifact, KNOWN_SESSION_EVENT_TYPES)
     return {
       meta: this.meta,
       inheritedEventCount: SessionLogOffset(artifact.inheritedEventCount),
       events: artifact.events as unknown as SessionEvent[],
-      committedBytes: this.committedBytes,
-    }
-  }
-
-  /**
-   * Finish a bounded scan after checking every complete row and the exact fork cut.
-   * @returns the retained events, lineage cut, and complete stored cursor.
-   */
-  finishWindow(): SessionLogWindowScan {
-    const reader = this.reader
-    if (reader.kind !== 'window') throw new Error('scanner has no bounded-window policy')
-    this.finished = true
-    const inheritedEventCount = SessionLogOffset(reader.decoder.finish(reader.collector))
-    const events = reader.index === 0
-      ? reader.events
-      : [...reader.events.slice(reader.index), ...reader.events.slice(0, reader.index)]
-    return {
-      meta: this.meta,
-      inheritedEventCount,
-      events,
-      cursor: this.eventCount === 0 ? -1 : SessionSeq(this.eventCount - 1),
-      hasMore: events.length > 0 && (events[0] as SessionEvent).seq > 0,
       committedBytes: this.committedBytes,
     }
   }
@@ -557,7 +490,7 @@ export class SessionLogScanner {
     // This scanner accepts only current-generation files. Owned structural refusal must
     // precede its recoverable-tail suppression, independently of the strict decoder state.
     try {
-      assertV3RowAdmission(decoded)
+      assertV4RowAdmission(decoded, KNOWN_SESSION_EVENT_TYPES)
     } catch (error: unknown) {
       if (error instanceof SessionFormatUnsupportedMigrationError) throw new SessionFormatUnsupportedError(error.message)
       throw error
@@ -569,10 +502,9 @@ export class SessionLogScanner {
       return
     }
     try {
-      if (this.reader.kind === 'complete') this.reader.restore.decodeRow(decoded)
-      else this.reader.decoder.decodeRow(decoded, this.reader.collector)
+      this.restore.decodeRow(decoded)
     } catch (error: unknown) {
-      // Unsupported V3 rows have already been refused before recovery.
+      // Unsupported current-format rows have already been refused before recovery.
       /* v8 ignore next -- every production Session format decoder rejects with Error. */
       const detail = error instanceof Error ? error.message : String(error)
       const issue = new Error(`corrupt session log: invalid committed event at line ${this.eventLine}: ${detail}`, {
@@ -584,23 +516,8 @@ export class SessionLogScanner {
         && (decoded as { type?: unknown }).type === 'turn/end') throw issue
       return
     }
-    if (this.reader.kind === 'window') this.retainWindowEvents(this.reader)
     this.eventCount += 1
     this.committedBytes = endByte
-  }
-
-  /** Deliver the current row outside decoder error handling and retain only the requested window. */
-  private retainWindowEvents(reader: WindowDecoderState): void {
-    const events = validateStoredEvents(this.meta, reader.collector.values.splice(0) as SessionEvent[])
-    for (const event of events) {
-      reader.options.onEvent?.(event)
-      if (event.seq >= (reader.options.beforeSeq ?? Number.MAX_SAFE_INTEGER)) continue
-      if (reader.events.length < reader.options.maxEvents) reader.events.push(event)
-      else {
-        reader.events[reader.index] = event
-        reader.index = (reader.index + 1) % reader.options.maxEvents
-      }
-    }
   }
 }
 
@@ -618,29 +535,4 @@ export function scanLog(buffer: Buffer): SessionLogScan {
   const scanner = new SessionLogScanner(buffer.subarray(0, headerEnd + 1))
   scanner.write(buffer.subarray(headerEnd + 1))
   return scanner.finish()
-}
-
-/**
- * Validate current plaintext JSONL while retaining one backwards window.
- * @param buffer - complete or torn JSONL bytes.
- * @param beforeSeq - exclusive upper offset; omitted selects the tail.
- * @param maxEvents - positive event retention ceiling.
- * @param onEvent - optional visitor for the complete validated event prefix.
- * @returns bounded events and complete-prefix metadata.
- */
-export function scanLogWindow(
-  buffer: Buffer,
-  beforeSeq: SessionLogOffsetType | undefined,
-  maxEvents: number,
-  onEvent?: (event: SessionEvent) => void,
-): SessionLogWindowScan {
-  const headerEnd = buffer.indexOf(0x0A)
-  if (headerEnd === -1) throw new Error('empty or header-less session log')
-  const scanner = new SessionLogScanner(
-    buffer.subarray(0, headerEnd + 1),
-    'recoverable',
-    { ...beforeSeq === undefined ? {} : { beforeSeq }, maxEvents, ...onEvent === undefined ? {} : { onEvent } },
-  )
-  scanner.write(buffer.subarray(headerEnd + 1))
-  return scanner.finishWindow()
 }

@@ -15,13 +15,14 @@ import { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import { AttachmentStore } from '@deepseek-ai/dsh-attachment'
-import { agentPresetProjectionDefinition } from '@deepseek-ai/dsh-agent-presets'
+import { agentPresetProjectionDefinition } from '@deepseek-ai/dsh-agent-preset-registry'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SESSION_FORMAT_VERSION, SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, UserMessage } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import SessionProjectionCache, { projectionCacheDomainSpec } from '@deepseek-ai/dsh-session-projection-cache'
+import { titleProjectionDefinition } from '@deepseek-ai/dsh-session-title'
 import Storage from '@deepseek-ai/dsh-storage'
 import * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import * as StorageJson from '@deepseek-ai/dsh-storage-json'
@@ -30,8 +31,7 @@ import {
   mountAgentLoopTestDependencies,
   mountAgentLoopTestHarness,
 } from '@deepseek-ai/dsh-agent-loop-testkit'
-import { createSessionTestRemote, installSessionReadTestServices, testSessionPersistence, type TestSessionRemote } from './test-remote.ts'
-import { SessionHistoryController } from '../src/history.ts'
+import { createSessionTestRemote, testSessionPersistence, type TestSessionRemote } from './test-remote.ts'
 
 const ownedContexts = new Set<Context>()
 afterEach(async () => {
@@ -69,7 +69,7 @@ function page(
 
 /** Read and close one snapshot-first follow generation. */
 async function opening(
-  remote: Pick<SessionHistoryController, 'follow'>,
+  remote: TestSessionRemote,
   sessionId: SessionId,
   maxMessages?: number,
 ): Promise<Extract<SessionFollowFrame, { type: 'snapshot' }>> {
@@ -379,16 +379,9 @@ describe('session.history projections block', () => {
 
   it('leaves the imageLimits key absent while no attachment service is composed', async () => {
     const { ctx, session } = await harness(true)
-    try {
-      installSessionReadTestServices(ctx)
-      const history = new SessionHistoryController(ctx, (observation) => { observation[Symbol.dispose]() })
-      seedMessages(session, 1)
-      expect(ctx.get('attachments')).toBeUndefined()
-      const snapshot = await opening(history, session.id)
-      expect('imageLimits' in snapshot.projections.values).toBe(false)
-    } finally {
-      await ctx.fiber.dispose()
-    }
+    seedMessages(session, 1)
+    const snapshot = await opening(remote(ctx), session.id)
+    expect('imageLimits' in snapshot.projections.values).toBe(false)
   })
 
   it('never carries the block on loadOlder pages (beforeSeq present)', async () => {
@@ -567,6 +560,7 @@ describe('session.list projections column', () => {
     const row = response.value.items.find(item => item.sessionId === coldId)
     expect(row?.running).toBe(false)
     expect(row?.projections).toEqual({
+      kind: 'cached',
       asOfSeq: 7,
       values: {
         'test/last-user': { text: 'cached' },
@@ -625,6 +619,89 @@ describe('session.list projections column', () => {
       expect(JSON.stringify(row)).not.toContain(secret)
     } finally {
       await ctx.fiber.dispose()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('lists a forked Session\'s cached title after a Host restart without opening its body', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'dsh-api-projcache-'))
+    const id = SessionId('session-cold-fork')
+    /** One Host process over `root`: storage stack, registry with the title unit, and the cache. */
+    const boot = async (): Promise<Context> => {
+      const ctx = new Context()
+      await ctx.plugin(Storage)
+      await ctx.plugin(StorageJson, { root })
+      await ctx.plugin(StorageDomain, { backend: 'json' })
+      await ctx.plugin(SessionStore)
+      await ctx.plugin(AgentRegistry)
+      await ctx.plugin(SessionProjectionRegistry)
+      ctx.sessionProjections.register(titleProjectionDefinition)
+      await ctx.plugin(SessionProjectionCache, { writeEveryEvents: 100, writeIntervalMs: 60_000 })
+      return ctx
+    }
+
+    // First process: a fork inherits its ancestor's prompt and title, the
+    // cache checkpoints the fold, and the process ends without ever listing.
+    const first = await boot()
+    let header: SessionHeader | undefined
+    let lastSeq: number | undefined
+    let promptTime: number | undefined
+    try {
+      remote(first)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      let child: Session | undefined
+      const owner = await first.plugin(Object.assign((sessionCtx: Context) => {
+        const parent = sessionCtx.sessions.create(SessionId('session-cold-fork-parent'), {
+          meta: { createdAt: 5, cwd: '/workspace' },
+        })
+        parent.append('turn/start', { turn: 1 })
+        promptTime = parent.append('user/message', createUserMessage({
+          content: [{ type: 'text', text: 'ancestor prompt' }],
+          source: { kind: 'user' },
+        }), { surfaceOp: 'append' }).time
+        parent.append('session/title', { title: 'Forked title', messageSeqs: [], source: { kind: 'user' } })
+        parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+        child = sessionCtx.sessions.fork(parent, undefined, id)
+      }, { inject: ['sessions'] }))
+      if (child === undefined) throw new Error('child was not forked')
+      expect(child.header.isSeeded).toBe(true)
+      expect(child.inheritedEventCount).toBe(4)
+      await first.sessionProjectionCache.write(child)
+      header = child.header
+      lastSeq = child.seq - 1
+      await owner.dispose()
+    } finally {
+      await first.fiber.dispose()
+    }
+    if (header === undefined || lastSeq === undefined || promptTime === undefined) throw new Error('unreachable')
+
+    // Second process: persistence knows the header, the cache holds the
+    // record, and nothing opens the log.
+    const second = await boot()
+    try {
+      const gateway = remote(second)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const load = () => { throw new Error('a cold fork listing must not load the event log') }
+      second.provide('sessionPersistence', testSessionPersistence(second, {
+        list: async () => [header],
+        inspect: load,
+        open: load,
+      }) as never)
+
+      const response = await gateway.list(request({}))
+      if (!response.ok) throw new Error('unreachable')
+      const row = response.value.items.find(item => item.sessionId === id)
+      // Cold recency is the later of the header's creation time and the cached
+      // last prompt; the fork's creation time is wall-clock and may trail the
+      // inherited prompt by a tick.
+      expect(row).toMatchObject({ blank: false, updatedAt: Math.max(header.createdAt, promptTime) })
+      expect(row?.projections).toMatchObject({
+        kind: 'cached',
+        asOfSeq: lastSeq,
+        values: { title: 'Forked title', sessionListMetadata: { blank: false, lastPromptAt: promptTime } },
+      })
+    } finally {
+      await second.fiber.dispose()
       await rm(root, { recursive: true, force: true })
     }
   })
