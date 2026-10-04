@@ -9,7 +9,7 @@ kind: "package-reference"
 
 ## 概述
 
-使用本包可为会话历史增加带排序的 SQLite FTS5 搜索，既能跨会话搜索，也能在单个会话内搜索，并支持游标分页。它把实时与持久化历史索引到独立的派生数据库，因此搜索反映当前状态，同时不会修改会话持久化存储。精确读取、过滤与追踪仍通过同一查询 API 提供。已发布组合中的搜索是可选能力；配置 `openAt` 可让索引在启动时、首次搜索时打开，或永不打开。结果匹配 token 与短语，而非任意子字符串；每个索引路径只能由一个进程持有。
+使用本包可为会话历史增加带排序的 SQLite FTS5 搜索，既能跨会话搜索，也能在单个会话内搜索，并支持游标分页。它把实时与持久化历史索引到独立的派生数据库，因此搜索反映当前状态，同时不会修改会话持久化存储。精确读取、过滤与追踪仍通过同一查询 API 提供。已发布组合中的搜索是可选能力；配置 `openAt` 可让索引在启动时、首次搜索时打开，或永不打开。结果匹配字面关键词，包括 CJK 单字与双字 token；每个索引路径只能由一个进程持有。
 
 ## 目录
 
@@ -57,11 +57,11 @@ kind: "package-reference"
 
 ### 搜索行为
 
-`searchSessions` 搜索整个语料库，并按每个会话匹配最强的事件分组结果；`searchEvents` 搜索一个逻辑会话。查询是字面短语：首尾空白会被移除、内部空白会被规范化，引号、`OR`、`NEAR` 和 `*` 等 FTS5 语法被视为数据，绝不作为可执行查询语法。元数据过滤器（会话 id、cwd、创建时间、父级、可用性、事件 seq/时间/类型/表层）在排序前缩小结果。默认搜索全部 `current`、`shadowed` 与 `log-only` 事件；传入表层过滤器可缩小范围。
+`searchSessions` 搜索整个语料库，并按每个会话匹配最强的事件分组结果；`searchEvents` 搜索一个逻辑会话。查询对空白分隔的字面关键词执行 AND 匹配：首尾空白会被移除、内部空白会被规范化，引号、`OR`、`NEAR` 和 `*` 等 FTS5 语法被视为数据，绝不作为可执行查询语法。元数据过滤器（会话 id、cwd、创建时间、父级、可用性、事件 seq/时间/类型/表层）在排序前缩小结果。默认搜索全部 `current`、`shadowed` 与 `log-only` 事件；传入表层过滤器可缩小范围。
 
 排序是确定性的：实际 FTS5 高亮匹配 span 更多的在前，然后文档更短的在前，事件时间、会话 id 与 seq 打破平局。结果携带按 `snippetChars` 个 Unicode 码点截断的纯文本摘录，没有提供方专用数值分数。分页通过不透明 `SessionSearchCursor` 延续，游标绑定到规范化后的确切请求；相关语料库变化时游标变为陈旧（`SESSION_QUERY_STALE_CURSOR`），会话内游标可在不相关会话变化后延续，跨会话游标则不能。
 
-`unicode61` tokenizer 匹配 token 与短语，而非任意子字符串：`AI` 不匹配 token `BRAID`。需要执行字面、空白灵活的字符串子串扫描时，使用带 `text` 子句的 `ctx.sessionQuery.filterEvents()`。
+CJK 连续文本索引为单字与双字 token，以支持子串召回；查询中的所有双字 token 都必须出现，但不要求相邻，精确子串验证应使用 `filterEvents()`；其他文本使用 `unicode61` 的 token 匹配：`AI` 不匹配 token `BRAID`。需要执行字面、空白灵活的字符串子串扫描时，使用带 `text` 子句的 `ctx.sessionQuery.filterEvents()`。
 
 ### 何时推迟或关闭搜索
 
@@ -81,6 +81,8 @@ kind: "package-reference"
 
 本节解释后端背后的设计决策，并指出实现它们的代码位置；可观察行为已在[使用本包](#use-this-package)中完整说明。
 
+实时对账复用不可变 Session 事件切点，只对追加事件计算哈希、插入新文档，并更新新被遮蔽的行。缓存写入位置仅在 SQLite 提交后推进。高亮文档窗口先在 SQL 中裁剪，再传入 JavaScript 并还原原始 CJK 文本。
+
 ### 设计理念
 
 本后端建立在一个分离与三项承诺之上：
@@ -88,7 +90,7 @@ kind: "package-reference"
 - **派生索引，绝不动源存储。** FTS 行存放在专用可丢弃数据库中；这里的代码从不打开 session-persistence 数据库。
 - **实时优先的观察。** 一个串行化状态机比较持久化快照修订，只通过短生命周期读取句柄读取新增或已更改日志，并在一个事务中对账，因此搜索反映最新的稳定状态。
 - **世代绑定的游标。** 每次语料库变化都会递增世代；游标携带其创建时的世代，宁可陈旧失败也不返回偏移后的页面。
-- **字面短语即数据。** 调用方查询文本被引成一个 FTS5 短语，查询语法保持惰性；保留高亮标记在索引前从文档中剥离。
+- **字面关键词即数据。** 调用方查询关键词分别被引成 FTS5 短语，查询语法保持惰性；保留高亮标记在索引前从文档中剥离。
 
 设计历史记录在 [SQLite FTS5 会话搜索笔记](../../../.agents/notes/archived/feature/2026-07-10-sqlite-session-query-provider.md)与[统一服务决策](../../../.agents/notes/archived/architecture/2026-07-23-unified-session-query-service.md)中。
 
@@ -99,7 +101,6 @@ kind: "package-reference"
 | [`src/index.ts`](src/index.ts) | 服务：配置、openAt 生命周期、串行化对账、查询执行、游标 |
 | [`src/query.ts`](src/query.ts) | 请求规范化、参数化谓词、摘录、谓词与绑定预算 |
 | [`src/schema.ts`](src/schema.ts) | 数据库 schema、application id 归属、原地重置、仅所有者文件创建 |
-| — | 不发布运行时不变式伴生入口；系统会在每次串行化查询边界校验对账、游标世代与派生索引归属。 |
 
 ### 索引生命周期
 
@@ -144,7 +145,7 @@ kind: "package-reference"
 
 - **无调用方授权**——这是上下文范围内的可信服务；模型工具或 UI 必须强制执行自己的访问策略。
 - **同步查询执行**——`DatabaseSync` 在 MATCH 执行期间会阻塞 JavaScript 线程，且无法中断已运行的语句。
-- **Token 召回，而非任意子字符串**——`unicode61` tokenizer 不会匹配更大 token 中的子字符串；对字面扫描使用 `filterEvents()`。
+- **非 CJK 的 token 召回**——`unicode61` tokenizer 不会匹配更大 token 中的非 CJK 子字符串；对字面扫描使用 `filterEvents()`。
 - **单一所有者的派生索引**——每个索引路径必须仅归一个进程中的一个服务所有；不支持外部写入者与多进程共享。
 
 <a id="dev-note"></a>
@@ -157,6 +158,6 @@ kind: "package-reference"
 
 #### 未来：其他 tokenizer 与搜索提供方
 
-`unicode61` tokenizer 的选择牺牲子字符串召回，以换取较小的索引体积与双字符 token 支持；trigram 备选方案经实测后被否决。切换 tokenizer 或增加另一个搜索后端会改变索引召回，并需要各自的对账与世代方案。
+CJK 单字与双字扩展增加索引体积；非 CJK 的 `unicode61` token 保持完整词匹配；trigram 备选方案经实测后被否决。切换 tokenizer 或增加另一个搜索后端会改变索引召回，并需要各自的对账与世代方案。
 
 </details>

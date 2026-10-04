@@ -1,0 +1,14 @@
+# Opt in to model-facing searches against the shared SQLite provider.
+- insert:
+    - id: tool-session-query
+      name: '@deepseek-ai/dsh-tool-session-query'
+
+- id: session-query-sqlite
+  name: '@deepseek-ai/dsh-session-query-sqlite'
+  config:
+    path: ':memory:'
+    openAt: startup
+
+- insert:
+    - id: cjk-evidence
+      name: ./cjk-evidence.mjs

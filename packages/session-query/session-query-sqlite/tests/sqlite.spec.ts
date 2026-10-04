@@ -509,7 +509,7 @@ describe('SQLite session search', () => {
     })).rejects.toThrow(expectCode('SESSION_QUERY_INVALID_FILTER'))
   })
 
-  it('uses literal phrase tokens, stable ties, and bounded Unicode snippets', async () => {
+  it('ANDs literal query terms, keeps stable ties, and bounds Unicode snippets', async () => {
     const ctx = await liveContext({ path: ':memory:', defaultLimit: 10, maxLimit: 10, snippetChars: 5 })
     ctx.sessions.create(SessionId('a'), { seed: messageEvents('😀😀 alpha beta BRAID 😀😀', 10), meta: { createdAt: 1 } })
     ctx.sessions.create(SessionId('b'), { seed: messageEvents('alpha beta', 10), meta: { createdAt: 1 } })
@@ -520,7 +520,7 @@ describe('SQLite session search', () => {
     ctx.sessions.create(SessionId('quote'), { seed: messageEvents('say "needle" exactly', 10), meta: { createdAt: 1 } })
 
     const phrase = await ctx.sessionQuery.searchSessions({ query: 'alpha beta' })
-    expect(phrase.items.map(item => item.header.id)).toEqual([SessionId('b'), SessionId('d'), SessionId('a')])
+    expect(phrase.items.map(item => item.header.id)).toEqual([SessionId('b'), SessionId('d'), SessionId('c'), SessionId('a')])
     expect(phrase.items.every(item => Array.from(item.bestMatch.snippet).length <= 5)).toBe(true)
     await expect(ctx.sessionQuery.searchSessions({ query: 'AI' })).resolves.toEqual({ items: [] })
     await expect(ctx.sessionQuery.searchSessions({ query: 'needle OR absent' }))
@@ -528,6 +528,98 @@ describe('SQLite session search', () => {
     await expect(ctx.sessionQuery.searchSessions({ query: 'say "needle"' }))
       .resolves.toMatchObject({ items: [{ header: { id: SessionId('quote') } }] })
     await expect(ctx.sessionQuery.searchSessions({ query: '*' })).resolves.toEqual({ items: [] })
+  })
+
+  it('searches CJK substrings at any length in live and persisted sessions', async () => {
+    const durable = header('cjk-persisted', 5)
+    TestPersistence.reset([{ meta: durable, events: messageEvents('持久化中文查询', 10) }])
+    const ctx = await liveContext({ path: ':memory:', snippetChars: 60 })
+    await ctx.plugin(TestPersistence)
+    const live = ctx.sessions.create(SessionId('cjk-live'), {
+      seed: messageEvents('今天遇到内存溢出的问题', 10),
+    })
+
+    for (const query of ['内存', '溢出', '内存溢出', '内', '出', '今天']) {
+      await expect(ctx.sessionQuery.searchEvents({ sessionId: live.id, query }))
+        .resolves.toMatchObject({ items: [{ sessionId: live.id, seq: 0 }] })
+      await expect(ctx.sessionQuery.searchSessions({
+        query,
+        sessionFilters: [{ kind: 'id', values: [live.id] }],
+      })).resolves.toMatchObject({ items: [{ header: { id: live.id } }] })
+    }
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: live.id, query: '磁盘' }))
+      .resolves.toMatchObject({ items: [] })
+
+    await expect(ctx.sessionQuery.searchSessions({ query: '中文' }))
+      .resolves.toMatchObject({ items: [{ header: durable, live: false, persisted: true }] })
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: durable.id, query: '持久化' }))
+      .resolves.toMatchObject({ session: durable, items: [{ sessionId: durable.id, seq: 0 }] })
+    const events = await ctx.sessionQuery.searchEvents({ sessionId: live.id, query: '内存' })
+    expect(events.items[0]!.snippet).toBe('今天遇到内存溢出的问题')
+  })
+
+  it('bounds CJK snippets by code points and shows only original characters', async () => {
+    const ctx = await liveContext({ path: ':memory:', snippetChars: 12 })
+    const padding = '序'.repeat(100)
+    const original = `${padding}内存溢出问题${padding}`
+    const session = ctx.sessions.create(SessionId('cjk-snippet'), {
+      seed: messageEvents(original, 10),
+    })
+
+    const page = await ctx.sessionQuery.searchEvents({ sessionId: session.id, query: '内存' })
+    expect(page.items).toHaveLength(1)
+    const snippet = page.items[0]!.snippet
+    expect(Array.from(snippet).length).toBeLessThanOrEqual(12)
+    expect(snippet).toContain('内存')
+    // Token separators and duplicated bigram tails must never leak: the
+    // snippet body is always a substring of the original text.
+    expect(original.includes(snippet.replaceAll('…', ''))).toBe(true)
+  })
+
+  it('reindexes only appended live events and updates shadowed surfaces incrementally', async () => {
+    const ctx = await liveContext({ path: ':memory:' })
+    const session = ctx.sessions.create(SessionId('incremental'), {
+      seed: messageEvents('original needle', 10),
+    })
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: session.id, query: 'needle' }))
+      .resolves.toMatchObject({ items: [{ seq: 0, surface: 'current' }] })
+    const db = Reflect.get(ctx.sessionQuery, '_db') as DatabaseSync
+    const docs = () => db.prepare(
+      'SELECT COUNT(*) AS count FROM temp.live_docs WHERE session_id = ?',
+    ).get(session.id) as { count: number }
+    const firstCount = docs().count
+
+    // An unrelated live session changing must not rebuild this session's docs.
+    ctx.sessions.create(SessionId('incremental-other'), { seed: messageEvents('other needle', 10) })
+    await ctx.sessionQuery.searchSessions({ query: 'other' })
+    expect(docs().count).toBe(firstCount)
+
+    // Appending reuses indexed rows and only inserts the new document.
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'appended needle' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    await expect(ctx.sessionQuery.searchEvents({ sessionId: session.id, query: 'appended' }))
+      .resolves.toMatchObject({ items: [{ seq: 2 }] })
+    expect(docs().count).toBe(firstCount + 1)
+
+    // A positional replacement shadows the original via UPDATE, and the
+    // replacement itself is searchable as current.
+    session.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'replacement needle' }], source: { kind: 'user' },
+    }), { surfaceOp: { op: 'replace', startSeq: SessionSeq(0), endSeq: SessionSeq(0) }, sourceEventSeqs: [SessionSeq(0)] })
+    const shadowed = await ctx.sessionQuery.searchEvents({
+      sessionId: session.id,
+      query: 'needle',
+      filters: [{ kind: 'surface', values: ['shadowed'] }],
+    })
+    expect(shadowed.items.map(item => item.seq)).toEqual([0])
+    const current = await ctx.sessionQuery.searchEvents({
+      sessionId: session.id,
+      query: 'original',
+      filters: [{ kind: 'surface', values: ['current'] }],
+    })
+    expect(current.items).toHaveLength(0)
+    expect(docs().count).toBe(firstCount + 2)
   })
 
   it('ranks live and persisted matches on one source-comparable contract', async () => {
@@ -860,6 +952,25 @@ describe('SQLite reconciliation and source lifecycle', () => {
       .resolves.toMatchObject({ items: [{ header: shared, live: false, persisted: true }] })
     expect(TestPersistence.reads.get(shared.id)).toBe(1)
     await persistence.dispose()
+  })
+
+  it('tolerates live-owned revision churn during persisted observation', async () => {
+    const shared = header('churning-live', 10)
+    TestPersistence.reset([{ meta: shared, events: messageEvents('churning needle') }])
+    const ctx = await liveContext()
+    ctx.sessions.create(shared.id, {
+      seed: messageEvents('live needle'),
+      meta: { createdAt: 10 },
+    })
+    await ctx.plugin(TestPersistence)
+    // Write-behind revisions churn while the TEMP live rows own search content.
+    TestPersistence.listEffect = () => {
+      TestPersistence.set({ meta: shared, events: messageEvents(`churning ${TestPersistence.nextRevision}`) })
+    }
+
+    await expect(ctx.sessionQuery.searchSessions({ query: 'live' }))
+      .resolves.toMatchObject({ items: [{ header: { id: shared.id }, live: true, persisted: true }] })
+    await ctx.sessionQuery.searchSessions({ query: 'live' })
   })
 
   it('retries when a live owner attaches during persistence observation', async () => {

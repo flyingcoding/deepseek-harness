@@ -6,10 +6,9 @@ import { dirname, resolve } from 'node:path'
 
 /**
  * Current derived-index schema version. Incompatible versions reset in place.
- * Version 9 stores CJK runs as unigram+bigram token streams, which version-8
- * indexes cannot answer.
+ * Version 10 rebuilds earlier indexes before enabling CJK token expansion.
  */
-export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 9
+export const SESSION_QUERY_SQLITE_SCHEMA_VERSION = 10
 
 /** SQLite application id protecting unrelated databases from derived resets. */
 export const SESSION_QUERY_SQLITE_APPLICATION_ID = 0x44534851
