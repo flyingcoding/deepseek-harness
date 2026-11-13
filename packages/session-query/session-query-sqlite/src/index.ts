@@ -8,6 +8,7 @@ import { createHash, randomUUID, type Hash } from 'node:crypto'
 import { SESSION_FORMAT_VERSION, SessionSeq, foldSurface } from '@deepseek-ai/dsh-session'
 import type { DatabaseSync, StatementSync } from 'node:sqlite'
 import { Context, Service, type Fiber } from '@deepseek-ai/cordis'
+import { brandString } from '@deepseek-ai/dsh-brand'
 import z from '@deepseek-ai/schemastery'
 import type { Session, SessionEvent, SessionHeader, SessionId, SessionLogOffset, SurfaceFoldResult } from '@deepseek-ai/dsh-session'
 import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
@@ -21,7 +22,6 @@ import SessionQueryEngine, {
   SESSION_QUERY_DEFAULT_PREPARED_SESSION_CACHE_MAX_EVENTS,
   SESSION_QUERY_READ_WINDOW_MAX,
   SessionQueryError,
-  SessionSearchCursor,
   assertSessionHeadersCompatible,
   extractSessionEventText,
   readColdSessionLog,
@@ -1183,7 +1183,7 @@ function page<Row, Item>(
 }
 
 function encodeCursor(payload: CursorPayload): SessionSearchCursorValue {
-  return SessionSearchCursor(Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url'))
+  return brandString<SessionSearchCursorValue>(Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url'))
 }
 
 function decodeCursor(
